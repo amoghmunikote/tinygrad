@@ -51,7 +51,7 @@ class _System:
 
   def system_paddrs(self, vaddr:int, size:int) -> list[int]:
     self.pagemap.seek(vaddr // mmap.PAGESIZE * 8)
-    return [(x & ((1<<55) - 1)) * mmap.PAGESIZE for x in array.array('Q', self.pagemap.read(size//mmap.PAGESIZE*8, binary=True))]
+    return [(x & ((1<<55) - 1)) * mmap.PAGESIZE for x in array.array('Q', self.pagemap.read(ceildiv(size, mmap.PAGESIZE)*8, binary=True))]
 
   def pci_scan_bus(self, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None) -> list[str]:
     all_devs = []
