@@ -334,7 +334,10 @@ class NV_FLCN(NV_IP):
 
   def execute_bootloader(self, base:int, ucode:bytes, start_tag:int, dmem_desc:bytes, ctx_dma:int, mailbox=None):
     self.disable_ctx_req(base)
-    self.imem_copy_direct(base, 0x10000 - len(ucode), ucode, secure=False, tag=start_tag << 8)
+    # The IMEM destination must exactly equal start_tag<<8 (nova-core: "dst_start and start_tag<<8 are expected to be
+    # identical values", no correction applied anywhere) -- NOT "top of 64K IMEM minus ucode length". These only
+    # coincide when the firmware's embedded start tag happens to already point exactly len(ucode) below 0x10000.
+    self.imem_copy_direct(base, start_tag << 8, ucode, secure=False, tag=start_tag << 8)
     self.dmem_copy_direct(base, 0, dmem_desc)
     self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)[ctx_dma].update(target=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM,
       mem_type=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL)
