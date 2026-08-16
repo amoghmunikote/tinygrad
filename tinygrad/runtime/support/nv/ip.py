@@ -109,6 +109,23 @@ class NV_FLCN(NV_IP):
 
   def prep_ucode(self):
     vbios_bytes, vbios_off = memoryview(bytes(array.array('I', self.nvdev.mmio[0x00300000//4:(0x00300000+0x100000)//4]))), 0
+
+    # GA100 (confirmed on CMP 170HX) ships an "IFR" (Init-From-Rom) header instead of starting directly at the legacy
+    # 0x55,0xAA expansion-ROM signature -- detect and skip it so everything below can keep indexing from a legacy-format
+    # base, same as before. Spec: https://docs.kernel.org/gpu/nova/core/vbios.html
+    if bytes(vbios_bytes[:2]) != b'\x55\xaa':
+      fixed0, fixed1, fixed2 = struct.unpack_from('<III', vbios_bytes, 0)
+      assert fixed0 == 0x4947564E, f"unrecognized VBIOS header, expected legacy 0x55AA or IFR 'NVGI', got {fixed0:#010x}"
+      versionsw = (fixed1 >> 8) & 0xff
+      if versionsw == 3:
+        rom_dir_off = struct.unpack_from('<I', vbios_bytes, fixed2 & 0xfffff)[0] + 4096
+        assert struct.unpack_from('<I', vbios_bytes, rom_dir_off)[0] == 0x44524652, f"IFR ROM directory signature mismatch at {rom_dir_off:#x}"
+        ifr_rom_off = struct.unpack_from('<I', vbios_bytes, rom_dir_off + 8)[0]
+      else:
+        ifr_rom_off = struct.unpack_from('<I', vbios_bytes, ((fixed1 >> 16) & 0x7fff) + 4)[0]
+      vbios_bytes = vbios_bytes[ifr_rom_off:]
+      assert bytes(vbios_bytes[:2]) == b'\x55\xaa', f"IFR-resolved offset {ifr_rom_off:#x} doesn't point at a legacy VBIOS image"
+
     while True:
       pci_blck = vbios_bytes[vbios_off + nv.OFFSETOF_PCI_EXP_ROM_PCI_DATA_STRUCT_PTR:].cast('H')[0]
       imglen = vbios_bytes[vbios_off + pci_blck + nv.OFFSETOF_PCI_DATA_STRUCT_IMAGE_LEN:].cast('H')[0] * nv.PCI_ROM_IMAGE_BLOCK_SIZE
