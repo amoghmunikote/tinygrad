@@ -47,6 +47,7 @@ class QMD:
 
   def __init__(self, dev:NVDevice, view:MMIOInterface|None=None, **kwargs):
     if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A: self.ver, self.sz = 5, 0x60
+    # AMPERE_COMPUTE_A < AMPERE_COMPUTE_B numerically, so this threshold already covers GA100 (_A) and GA102 (_B) alike.
     elif dev.iface.compute_class >= nv_gpu.AMPERE_COMPUTE_A: self.ver, self.sz = 3, 0x40
     else: self.ver, self.sz = 2, 0x40
 
@@ -483,8 +484,11 @@ class NVKIface:
     self.nvclasses = {classlist[i] for i in range(clsinfo.numClasses)}
     self.usermode_class = self._get_class([nv_gpu.HOPPER_USERMODE_A, nv_gpu.TURING_USERMODE_A])
     self.gpfifo_class = self._get_class([nv_gpu.BLACKWELL_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_CHANNEL_GPFIFO_A, nv_gpu.TURING_CHANNEL_GPFIFO_A])
-    self.compute_class = self._get_class([nv_gpu.BLACKWELL_COMPUTE_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.TURING_COMPUTE_A])
-    self.dma_class = self._get_class([nv_gpu.BLACKWELL_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_B, nv_gpu.TURING_DMA_COPY_A])
+    # AMPERE_COMPUTE_A/AMPERE_DMA_COPY_A are the classes compute-only Ampere (GA100: A100/A30/CMP170HX) reports, as
+    # opposed to the _B classes consumer Ampere (GA102 etc.) reports.
+    self.compute_class = self._get_class([nv_gpu.BLACKWELL_COMPUTE_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.AMPERE_COMPUTE_A,
+      nv_gpu.TURING_COMPUTE_A])
+    self.dma_class = self._get_class([nv_gpu.BLACKWELL_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_A, nv_gpu.TURING_DMA_COPY_A])
     self.viddec_class = self._get_class_or_none([nv_gpu.NVCFB0_VIDEO_DECODER, nv_gpu.NVC9B0_VIDEO_DECODER])
 
     usermode = self.rm_alloc(self.dev.subdevice, self.usermode_class)
@@ -603,7 +607,7 @@ class PCIIface(PCIIfaceBase):
     # PCIIface's MAP_FIXED mmap will overwrite UVM allocations made by NVKIface, so don't try PCIIface if kernel driver was already used.
     if NVKIface.root is not None: raise RuntimeError("Cannot use PCIIface after NVKIface has been initialized (would corrupt UVM memory)")
     super().__init__(dev, dev_id, vendor=0x10de,
-      devices=((0xff00, (0x1e00,0x1f00,0x2200,0x2400,0x2500,0x2600,0x2700,0x2800,0x2b00,0x2c00,0x2d00,0x2f00)),),
+      devices=((0xff00, (0x1e00,0x1f00,0x2000,0x2200,0x2400,0x2500,0x2600,0x2700,0x2800,0x2b00,0x2c00,0x2d00,0x2f00)),),
       base_class=0x03, vram_bar=1, va_start=NVMemoryManager.va_allocator.base, va_size=NVMemoryManager.va_allocator.size, dev_impl_t=NVDev)
 
     self.root, self.gpu_instance = 0xc1000000, 0

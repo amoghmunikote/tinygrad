@@ -12,7 +12,7 @@ __all__ = ["nv_ref", *swref.keys(), *hwref.keys()]
 has_addendum = (("ga102", "dev_gc6_island"), ("ga102", "dev_falcon_v4"))
 
 def __getattr__(nm):
-  arch_map = {"tu102":"turing", "ga102":"ampere", "gh100":"hopper", "gb202":"blackwell", "gp102":"pascal"}
+  arch_map = {"tu102":"turing", "ga102":"ampere", "ga100":"ampere", "gh100":"hopper", "gb202":"blackwell", "gp102":"pascal"}
   regs_off = {'NV_PFALCON_FALCON': 0x0, 'NV_PGSP_FALCON': 0x0, 'NV_PSEC_FALCON': 0x0, 'NV_PRISCV_RISCV': 0x1000, 'NV_PGC6_AON': 0x0, 'NV_PFSP': 0x0,
     'NV_PGC6_BSI': 0x0, 'NV_PFALCON_FBIF': 0x600, 'NV_PFALCON2_FALCON': 0x1000, 'NV_PBUS': 0x0, 'NV_PFB': 0x0, 'NV_PMC': 0x0, 'NV_PGSP_QUEUE': 0x0,
     'NV_VIRTUAL_FUNCTION':0xb80000, "NV_THERM": 0x0}

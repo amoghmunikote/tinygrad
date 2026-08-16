@@ -11,6 +11,7 @@ NV_DEBUG = getenv("NV_DEBUG", 0)
 
 CHIP_ARCH_NAMES = {0x16: "TU1", 0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}
 CHIP_FW_NAMES = {"TU1": "tu102", "GA1": "ga102", "AD1": "ad102", "GB2": "gb202"}
+CHIP_FW_OVERRIDES = {"GA100": "ga100"} # exact chip_name overrides, checked before the architecture-prefix table above
 
 class NVReg:
   def __init__(self, nvdev, base, off, fields=None): self.nvdev, self.base, self.off, self.fields = nvdev, base, off, fields
@@ -115,7 +116,7 @@ class NVDev:
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()
     self.chip_details = self.reg("NV_PMC_BOOT_42").read_bitfields()
     self.chip_name = CHIP_ARCH_NAMES[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
-    self.fw_name = CHIP_FW_NAMES[self.chip_name[:3]]
+    self.fw_name = CHIP_FW_OVERRIDES.get(self.chip_name, CHIP_FW_NAMES[self.chip_name[:3]])
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
 
     self.flcn:NV_FLCN|NV_FLCN_COT = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
@@ -138,6 +139,10 @@ class NVDev:
       if f['ecc_mode'] == 1: self.vram_size = self.vram_size // 16 * 15
     else:
       self.vram_size = self.reg("NV_PGC6_AON_SECURE_SCRATCH_GROUP_42").read() << 20
+      # GA100 (A100/A30) is an OpenROM-style server board; unverified whether this GC6-island scratch register is
+      # populated the same way as on desktop GA102, so sanity-check the result rather than silently mis-sizing VRAM.
+      if self.fw_name == "ga100" and not (8 << 30) <= self.vram_size <= (128 << 30) and DEBUG >= 1:
+        print(f"nv {self.devfmt}: WARNING: GA100 VRAM size read as {self.vram_size:#x}, outside plausible 8-128GiB range", flush=True)
 
     self.vram, self.mmio = self.pci_dev.map_bar(1), self.pci_dev.map_bar(0, fmt='I')
     self.large_bar = self.vram.nbytes >= self.vram_size
