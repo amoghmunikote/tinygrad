@@ -207,13 +207,14 @@ class NV_FLCN(NV_IP):
   def prep_frts_bootloader(self, image:bytes):
     assert self.desc_v2.DMEMPhysBase == 0, "generic bootloader always loads DMEM at destination offset 0"
 
-    gen_bl_fw_name = self.nvdev.fw_name
-    # NOTE(GA100): linux-firmware's nvidia/ga100/gsp/ has no gen_bootloader-*.bin at all (confirmed via directory
-    # listing), unlike nvidia/tu102/gsp/ which does. This is consistent with GA100 skipping FWSEC-FRTS entirely
-    # (per nova-core's driver notes) rather than using Turing's generic-bootloader mechanism for it. If GA100's real
-    # VBIOS FWSEC descriptor turns out to be V2 (see needs_bootloader/prep_ucode), this fetch will 404 -- that is
-    # itself a hardware-observable signal that GA100 needs a different WPR2/FRTS bring-up path than Turing's, still
-    # unresolved (see plan Phase 4.2).
+    # NOTE(GA100): confirmed on real hardware (CMP 170HX) that GA100's VBIOS FWSEC descriptor is V2, so it DOES take
+    # this generic-bootloader path like Turing (an earlier assumption here, that GA100 skips FWSEC-FRTS entirely, was
+    # wrong -- corrected after testing). linux-firmware's nvidia/ga100/gsp/ has no gen_bootloader-*.bin of its own
+    # though (confirmed via directory listing), so this reuses tu102's -- the stub is a tiny, chip-generic PIO-loader
+    # whose only job is DMA'ing the real FWSEC-FRTS image from sysmem, plausibly identical across no-BROM chips.
+    # This is a tested hypothesis, not a confirmed NVIDIA guarantee -- if wrong, expect a loud mailbox/hang failure
+    # downstream, not silent corruption.
+    gen_bl_fw_name = "tu102"
     sha = {"tu102": "b37776a511b4a00901e4e3ac568db917086d3bf439f85bc9b3e4adc7338a0aff"}[gen_bl_fw_name]
     h = nv.struct_nvfw_bin_hdr.from_buffer_copy(b:=fetch_fw(f"nvidia/{gen_bl_fw_name}/gsp", "gen_bootloader-570.144.bin", sha))
     bl_desc = nv.RM_FLCN_BL_DESC.from_buffer_copy(b, h.header_offset)
