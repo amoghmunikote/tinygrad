@@ -261,7 +261,9 @@ class NV_FLCN(NV_IP):
 
     self.reset(self.falcon)
     if self.nvdev.fw_name in ("tu102", "ga100"):
-      self.execute_bootloader(self.falcon, self.bl_ucode, self.bl_start_tag, self.dmem_desc, ctx_dma=4)
+      # nova-core explicitly zeroes MAILBOX0 before starting the falcon for this exact path (FwsecFirmwareWithBl::run
+      # -> falcon.boot(Some(0), None)); the bootloader stub itself never writes a mailbox to signal "started".
+      self.execute_bootloader(self.falcon, self.bl_ucode, self.bl_start_tag, self.dmem_desc, ctx_dma=4, mailbox=0)
     else:
       self.execute_hs(self.falcon, self.frts_image_paddr, code_off=0x0, data_off=self.desc_v3.IMEMLoadSize,
         imemPa=self.desc_v3.IMEMPhysBase, imemVa=self.desc_v3.IMEMVirtBase, imemSz=self.desc_v3.IMEMLoadSize,
