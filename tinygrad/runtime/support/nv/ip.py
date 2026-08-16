@@ -609,12 +609,18 @@ class NV_GSP(NV_IP):
       m = nv.GspFwWprMeta(**common, vgaWorkspaceSize=0x20000, pmuReservedSize=0x1820000, nonWprHeapSize=0x220000, gspFwHeapSize=0x8700000,
         frtsSize=0x100000)
     else:
+      # GA100 has no FRTS region (kgspGetFrtsSize_HAL returns 0 in NVIDIA's driver -- no display engine, doesn't use
+      # FRTS/WPR2 the way Turing does). frtsOffset = gspFwWprEnd - frtsSize, so frtsSize=0 correctly collapses
+      # frtsOffset to sit exactly at gspFwWprEnd (matching NVIDIA's real formula) without changing any other field's
+      # shape -- nothing else in this layout computation branches on frtsSize.
+      frts_sz = 0 if self.nvdev.fw_name == "ga100" else 0x100000
       m = nv.GspFwWprMeta(**common, vgaWorkspaceSize=(vga_sz:=0x100000), vgaWorkspaceOffset=(vga_off:=self.nvdev.vram_size-vga_sz),
-        gspFwWprEnd=vga_off, frtsSize=(frts_sz:=0x100000), frtsOffset=(frts_off:=vga_off-frts_sz), bootBinOffset=(boot_off:=frts_off-boot_sz),
+        gspFwWprEnd=vga_off, frtsSize=frts_sz, frtsOffset=(frts_off:=vga_off-frts_sz), bootBinOffset=(boot_off:=frts_off-boot_sz),
         gspFwOffset=(gsp_off:=round_down(boot_off-radix3_sz, 0x10000)), gspFwHeapSize=(gsp_heap_sz:=0x8100000), fbSize=self.nvdev.vram_size,
         gspFwHeapOffset=(gsp_heap_off:=round_down(gsp_off-gsp_heap_sz, 0x100000)), gspFwWprStart=(wpr_st:=round_down(gsp_heap_off-0x1000, 0x100000)),
         nonWprHeapSize=(non_wpr_sz:=0x100000), nonWprHeapOffset=(non_wpr_off:=round_down(wpr_st-non_wpr_sz, 0x100000)), gspFwRsvdStart=non_wpr_off)
-      assert self.nvdev.flcn.frts_offset == m.frtsOffset, f"FRTS mismatch: {self.nvdev.flcn.frts_offset} != {m.frtsOffset}"
+      if self.nvdev.fw_name != "ga100":
+        assert self.nvdev.flcn.frts_offset == m.frtsOffset, f"FRTS mismatch: {self.nvdev.flcn.frts_offset} != {m.frtsOffset}"
     self.wpr_meta, _, wpr_meta_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(type(m)), data=bytes(m))
     self.wpr_meta_sysmem = wpr_meta_addrs[0]
 
