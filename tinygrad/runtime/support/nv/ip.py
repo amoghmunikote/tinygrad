@@ -614,9 +614,16 @@ class NV_GSP(NV_IP):
       # frtsOffset to sit exactly at gspFwWprEnd (matching NVIDIA's real formula) without changing any other field's
       # shape -- nothing else in this layout computation branches on frtsSize.
       frts_sz = 0 if self.nvdev.fw_name == "ga100" else 0x100000
+      # kgspGetFwHeapSize_IMPL / _kgspCalculateFwHeapSize (open-gpu-kernel-modules): heap size is computed dynamically
+      # from usable FB size, not a fixed constant. Verified against a real dmesg capture on this exact GA100 card
+      # (fbSize=0x1000000000 -> heapSize=0x6e00000, matches exactly). HAL constants below (base=8MB, carveout=0,
+      # min=64MB, max=256MB) are shared by the same chip bucket as fw_name in ("tu102","ga100").
+      mem_size_gb = round_up(self.nvdev.vram_size, 1 << 30) >> 30
+      gsp_heap_sz = min(max((8 << 20) + round_up((96 << 10) * mem_size_gb, 1 << 20) + round_up((48 << 10) * 2048, 1 << 20),
+        64 << 20), 256 << 20)
       m = nv.GspFwWprMeta(**common, vgaWorkspaceSize=(vga_sz:=0x100000), vgaWorkspaceOffset=(vga_off:=self.nvdev.vram_size-vga_sz),
         gspFwWprEnd=vga_off, frtsSize=frts_sz, frtsOffset=(frts_off:=vga_off-frts_sz), bootBinOffset=(boot_off:=frts_off-boot_sz),
-        gspFwOffset=(gsp_off:=round_down(boot_off-radix3_sz, 0x10000)), gspFwHeapSize=(gsp_heap_sz:=0x8100000), fbSize=self.nvdev.vram_size,
+        gspFwOffset=(gsp_off:=round_down(boot_off-radix3_sz, 0x10000)), gspFwHeapSize=gsp_heap_sz, fbSize=self.nvdev.vram_size,
         gspFwHeapOffset=(gsp_heap_off:=round_down(gsp_off-gsp_heap_sz, 0x100000)), gspFwWprStart=(wpr_st:=round_down(gsp_heap_off-0x1000, 0x100000)),
         nonWprHeapSize=(non_wpr_sz:=0x100000), nonWprHeapOffset=(non_wpr_off:=round_down(wpr_st-non_wpr_sz, 0x100000)), gspFwRsvdStart=non_wpr_off)
       if self.nvdev.fw_name != "ga100":
