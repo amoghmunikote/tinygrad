@@ -136,7 +136,12 @@ class NV_FLCN(NV_IP):
           break
       vbios_off += imglen
 
-    bit_header = nv.BIT_HEADER_V1_00.from_buffer_copy(vbios_bytes[(bit_addr:=0x1b0):bit_addr + ctypes.sizeof(nv.BIT_HEADER_V1_00)])
+    # Per NVIDIA's BIOS Information Table spec there is no fixed BIT header offset -- it must be located by scanning
+    # for the 6-byte marker Id(0xB8FF) + Signature("BIT\0"). A hardcoded 0x1b0 only happened to work for VBIOS images
+    # shaped like GA102/Turing's; GA100 (confirmed on CMP 170HX) places it at a different offset (0xb0 there).
+    bit_addr = bytes(vbios_bytes[:0x4000]).find(b'\xff\xb8BIT\x00')
+    assert bit_addr != -1, "BIT header marker (Id=0xB8FF, Signature='BIT\\0') not found in first 0x4000 bytes of VBIOS"
+    bit_header = nv.BIT_HEADER_V1_00.from_buffer_copy(vbios_bytes[bit_addr:bit_addr + ctypes.sizeof(nv.BIT_HEADER_V1_00)])
     assert bit_header.Signature == 0x00544942, f"Invalid BIT header signature {hex(bit_header.Signature)}"
 
     for i in range(bit_header.TokenEntries):
