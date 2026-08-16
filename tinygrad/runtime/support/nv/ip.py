@@ -104,7 +104,12 @@ class NV_FLCN(NV_IP):
     self.nvdev.include("dev_sec_pri", "ga102")
     self.nvdev.include("dev_bus", "tu102")
 
-    self.prep_ucode()
+    # Confirmed in NVIDIA's own driver (kgspGetFrtsSize_HAL returns 0 for GA100, kernel_gsp_tu102.c's
+    # kgspPrepareForBootstrap/kgspBootstrap skip the whole FWSEC-FRTS Falcon stage whenever FRTS size is 0): GA100 has
+    # no display engine and doesn't use FRTS/WPR2 the way Turing does, so prep_ucode()'s FWSEC-FRTS VBIOS parsing and
+    # generic-bootloader path must not run for it at all -- this isn't a firmware-format difference (GA100's FWSEC
+    # ucode in VBIOS is still V2-formatted) but a driver-level decision to skip invoking it entirely.
+    if self.nvdev.fw_name != "ga100": self.prep_ucode()
     self.prep_booter()
 
   def prep_ucode(self):
@@ -259,17 +264,20 @@ class NV_FLCN(NV_IP):
   def init_hw(self):
     self.falcon, self.sec2 = 0x00110000, 0x00840000
 
-    self.reset(self.falcon)
-    if self.nvdev.fw_name in ("tu102", "ga100"):
-      # nova-core explicitly zeroes MAILBOX0 before starting the falcon for this exact path (FwsecFirmwareWithBl::run
-      # -> falcon.boot(Some(0), None)); the bootloader stub itself never writes a mailbox to signal "started".
-      self.execute_bootloader(self.falcon, self.bl_ucode, self.bl_start_tag, self.dmem_desc, ctx_dma=4, mailbox=0)
-    else:
-      self.execute_hs(self.falcon, self.frts_image_paddr, code_off=0x0, data_off=self.desc_v3.IMEMLoadSize,
-        imemPa=self.desc_v3.IMEMPhysBase, imemVa=self.desc_v3.IMEMVirtBase, imemSz=self.desc_v3.IMEMLoadSize,
-        dmemPa=self.desc_v3.DMEMPhysBase, dmemVa=0x0, dmemSz=self.desc_v3.DMEMLoadSize,
-        pkc_off=self.desc_v3.PKCDataOffset, engid=self.desc_v3.EngineIdMask, ucodeid=self.desc_v3.UcodeId)
-    assert self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read() != 0, "WPR2 is not initialized"
+    # GA100 skips the whole FWSEC-FRTS Falcon stage (see the matching comment in init_sw) -- straight to
+    # resetting into RISC-V mode, matching NVIDIA's kgspBootstrap_TU102 when kgspGetFrtsSize_HAL()==0.
+    if self.nvdev.fw_name != "ga100":
+      self.reset(self.falcon)
+      if self.nvdev.fw_name == "tu102":
+        # nova-core explicitly zeroes MAILBOX0 before starting the falcon for this exact path (FwsecFirmwareWithBl::run
+        # -> falcon.boot(Some(0), None)); the bootloader stub itself never writes a mailbox to signal "started".
+        self.execute_bootloader(self.falcon, self.bl_ucode, self.bl_start_tag, self.dmem_desc, ctx_dma=4, mailbox=0)
+      else:
+        self.execute_hs(self.falcon, self.frts_image_paddr, code_off=0x0, data_off=self.desc_v3.IMEMLoadSize,
+          imemPa=self.desc_v3.IMEMPhysBase, imemVa=self.desc_v3.IMEMVirtBase, imemSz=self.desc_v3.IMEMLoadSize,
+          dmemPa=self.desc_v3.DMEMPhysBase, dmemVa=0x0, dmemSz=self.desc_v3.DMEMLoadSize,
+          pkc_off=self.desc_v3.PKCDataOffset, engid=self.desc_v3.EngineIdMask, ucodeid=self.desc_v3.UcodeId)
+      assert self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read() != 0, "WPR2 is not initialized"
 
     self.reset(self.falcon, riscv=True)
 
