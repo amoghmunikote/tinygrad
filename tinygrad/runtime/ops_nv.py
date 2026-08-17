@@ -48,7 +48,6 @@ class QMD:
   def __init__(self, dev:NVDevice, view:MMIOInterface|None=None, **kwargs):
     self.compute_class = dev.iface.compute_class
     if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A: self.ver, self.sz = 5, 0x60
-    # AMPERE_COMPUTE_A < AMPERE_COMPUTE_B numerically, so this threshold already covers GA100 (_A) and GA102 (_B) alike.
     elif dev.iface.compute_class >= nv_gpu.AMPERE_COMPUTE_A: self.ver, self.sz = 3, 0x40
     else: self.ver, self.sz = 2, 0x40
 
@@ -162,8 +161,6 @@ class NVComputeQueue(NVCommandQueue):
     qmd.set_constant_buf_addr(0, args_state.buf.va_addr)
 
     if self.active_qmd is None or prg.dev.iface.compute_class == nv_gpu.AMPERE_COMPUTE_A:
-      # GA100: dependent QMD chaining is never visible to the compute-engine WFI, so we drain
-      # the previous kernel explicitly and dispatch each kernel independently via PCAS.
       if prg.dev.iface.compute_class == nv_gpu.AMPERE_COMPUTE_A and self.active_qmd is not None:
         self.nvm(1, nv_gpu.NVC6C0_WAIT_FOR_IDLE, 0)
       if prg.dev.pma_enabled: self.nvm(1, nv_gpu.NVC6C0_PM_TRIGGER, 0)
@@ -182,7 +179,6 @@ class NVComputeQueue(NVCommandQueue):
     return self
 
   def signal(self, signal:HCQSignal, value:sint=0):
-    # GA100 QMD release semaphore (RELEASE0) never fires; use the compute-engine WFI + GPFIFO path instead.
     if self.active_qmd is not None and self.active_qmd.compute_class != nv_gpu.AMPERE_COMPUTE_A:
       for i in range(2):
         names = self.active_qmd.signal_field_names(i)
@@ -202,7 +198,6 @@ class NVComputeQueue(NVCommandQueue):
             self.bind_sints_to_mem(value >> 32, mem=self.active_qmd_buf.cpu_view(), fmt='I', offset=val_off+4)
           return self
 
-    # GA100 or no active QMD: wait for all in-flight SKED work to drain, then write signal via GPFIFO.
     if self.active_qmd is not None: self.nvm(1, nv_gpu.NVC6C0_WAIT_FOR_IDLE, 0)
     self.nvm(0, nv_gpu.NVC56F_SEM_ADDR_LO, *data64_le(signal.value_addr), *data64_le(value),
              nv_flags("NVC56F_SEM_EXECUTE", operation="release", release_wfi="en", payload_size="64bit", release_timestamp="en"))
@@ -361,8 +356,6 @@ class NVProgram(HCQProgram['NVDevice']):
       qmd = {'qmd_major_version':3 if dev.iface.compute_class >= nv_gpu.AMPERE_COMPUTE_A else 2,
         'sm_global_caching_enable':1, 'program_address_upper':hi32(prog_addr), 'program_address_lower':lo32(prog_addr),
         'shared_memory_size':smem_size, 'register_count_v':self.regs_usage}
-      # GA100 (AMPERE_COMPUTE_A) follows Turing's convention: local memory lives in LOW_SIZE, HIGH_SIZE unused.
-      # GA102+ (AMPERE_COMPUTE_B) swapped to HIGH_SIZE for NVCC kernels; NAK still uses LOW_SIZE on all.
       if dev.iface.compute_class >= nv_gpu.AMPERE_COMPUTE_B:
         qmd[f'shader_local_memory_{"low" if NAK else "high"}_size'] = self.dev.slm_per_thread
       else:
@@ -494,8 +487,6 @@ class NVKIface:
     self.nvclasses = {classlist[i] for i in range(clsinfo.numClasses)}
     self.usermode_class = self._get_class([nv_gpu.HOPPER_USERMODE_A, nv_gpu.TURING_USERMODE_A])
     self.gpfifo_class = self._get_class([nv_gpu.BLACKWELL_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_CHANNEL_GPFIFO_A, nv_gpu.TURING_CHANNEL_GPFIFO_A])
-    # AMPERE_COMPUTE_A/AMPERE_DMA_COPY_A are the classes compute-only Ampere (GA100: A100/A30/CMP170HX) reports, as
-    # opposed to the _B classes consumer Ampere (GA102 etc.) reports.
     self.compute_class = self._get_class([nv_gpu.BLACKWELL_COMPUTE_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.AMPERE_COMPUTE_A,
       nv_gpu.TURING_COMPUTE_A])
     self.dma_class = self._get_class([nv_gpu.BLACKWELL_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_A, nv_gpu.TURING_DMA_COPY_A])
@@ -689,8 +680,6 @@ class NVDevice(HCQCompiled[NVSignal]):
       'num_tpc_per_gpc', 'num_sm_per_tpc', 'max_warps_per_sm', 'sm_version')
 
     # FIXME: no idea how to convert this for blackwells
-    # GA100's RM reports SM version 0x802 ("SM 8.02" internal stepping) but its public CUDA compute capability is sm_80.
-    # Every other chip has a lower byte matching the public CUDA minor version; 0x802 is the only outlier.
     if self.sm_version == 0x802:
       self.arch, self.sass_version = "sm_80", 0x80
     else:

@@ -139,8 +139,6 @@ class NVDev:
       if f['ecc_mode'] == 1: self.vram_size = self.vram_size // 16 * 15
     else:
       self.vram_size = self.reg("NV_PGC6_AON_SECURE_SCRATCH_GROUP_42").read() << 20
-      # GA100 (A100/A30) is an OpenROM-style server board; unverified whether this GC6-island scratch register is
-      # populated the same way as on desktop GA102, so sanity-check the result rather than silently mis-sizing VRAM.
       if self.fw_name == "ga100" and not (8 << 30) <= self.vram_size <= (128 << 30) and DEBUG >= 1:
         print(f"nv {self.devfmt}: WARNING: GA100 VRAM size read as {self.vram_size:#x}, outside plausible 8-128GiB range", flush=True)
 

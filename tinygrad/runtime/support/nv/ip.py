@@ -104,20 +104,12 @@ class NV_FLCN(NV_IP):
     self.nvdev.include("dev_sec_pri", "ga102")
     self.nvdev.include("dev_bus", "tu102")
 
-    # Confirmed in NVIDIA's own driver (kgspGetFrtsSize_HAL returns 0 for GA100, kernel_gsp_tu102.c's
-    # kgspPrepareForBootstrap/kgspBootstrap skip the whole FWSEC-FRTS Falcon stage whenever FRTS size is 0): GA100 has
-    # no display engine and doesn't use FRTS/WPR2 the way Turing does, so prep_ucode()'s FWSEC-FRTS VBIOS parsing and
-    # generic-bootloader path must not run for it at all -- this isn't a firmware-format difference (GA100's FWSEC
-    # ucode in VBIOS is still V2-formatted) but a driver-level decision to skip invoking it entirely.
     if self.nvdev.fw_name != "ga100": self.prep_ucode()
     self.prep_booter()
 
   def prep_ucode(self):
     vbios_bytes, vbios_off = memoryview(bytes(array.array('I', self.nvdev.mmio[0x00300000//4:(0x00300000+0x100000)//4]))), 0
 
-    # GA100 (confirmed on CMP 170HX) ships an "IFR" (Init-From-Rom) header instead of starting directly at the legacy
-    # 0x55,0xAA expansion-ROM signature -- detect and skip it so everything below can keep indexing from a legacy-format
-    # base, same as before. Spec: https://docs.kernel.org/gpu/nova/core/vbios.html
     if bytes(vbios_bytes[:2]) != b'\x55\xaa':
       fixed0, fixed1, fixed2 = struct.unpack_from('<III', vbios_bytes, 0)
       assert fixed0 == 0x4947564E, f"unrecognized VBIOS header, expected legacy 0x55AA or IFR 'NVGI', got {fixed0:#010x}"
@@ -141,9 +133,6 @@ class NV_FLCN(NV_IP):
           break
       vbios_off += imglen
 
-    # Per NVIDIA's BIOS Information Table spec there is no fixed BIT header offset -- it must be located by scanning
-    # for the 6-byte marker Id(0xB8FF) + Signature("BIT\0"). A hardcoded 0x1b0 only happened to work for VBIOS images
-    # shaped like GA102/Turing's; GA100 (confirmed on CMP 170HX) places it at a different offset (0xb0 there).
     bit_addr = bytes(vbios_bytes[:0x4000]).find(b'\xff\xb8BIT\x00')
     assert bit_addr != -1, "BIT header marker (Id=0xB8FF, Signature='BIT\\0') not found in first 0x4000 bytes of VBIOS"
     bit_header = nv.BIT_HEADER_V1_00.from_buffer_copy(vbios_bytes[bit_addr:bit_addr + ctypes.sizeof(nv.BIT_HEADER_V1_00)])
@@ -212,9 +201,6 @@ class NV_FLCN(NV_IP):
   def prep_frts_bootloader(self, image:bytes):
     assert self.desc_v2.DMEMPhysBase == 0, "generic bootloader always loads DMEM at destination offset 0"
 
-    # NOTE: this function is not reached for GA100 -- init_sw() skips prep_ucode() entirely for GA100 because
-    # kgspGetFrtsSize_HAL returns 0 for it (no display engine, no FRTS/WPR2 pre-init needed). If GA100 ever takes
-    # this path, it would need tu102's gen_bootloader (no nvidia/ga100/gsp/gen_bootloader-*.bin in linux-firmware).
     gen_bl_fw_name = "tu102"
     sha = {"tu102": "b37776a511b4a00901e4e3ac568db917086d3bf439f85bc9b3e4adc7338a0aff"}[gen_bl_fw_name]
     h = nv.struct_nvfw_bin_hdr.from_buffer_copy(b:=fetch_fw(f"nvidia/{gen_bl_fw_name}/gsp", "gen_bootloader-570.144.bin", sha))
@@ -260,13 +246,9 @@ class NV_FLCN(NV_IP):
   def init_hw(self):
     self.falcon, self.sec2 = 0x00110000, 0x00840000
 
-    # GA100 skips the whole FWSEC-FRTS Falcon stage (see the matching comment in init_sw) -- straight to
-    # resetting into RISC-V mode, matching NVIDIA's kgspBootstrap_TU102 when kgspGetFrtsSize_HAL()==0.
     if self.nvdev.fw_name != "ga100":
       self.reset(self.falcon)
       if self.nvdev.fw_name == "tu102":
-        # nova-core explicitly zeroes MAILBOX0 before starting the falcon for this exact path (FwsecFirmwareWithBl::run
-        # -> falcon.boot(Some(0), None)); the bootloader stub itself never writes a mailbox to signal "started".
         self.execute_bootloader(self.falcon, self.bl_ucode, self.bl_start_tag, self.dmem_desc, ctx_dma=4, mailbox=0)
       else:
         self.execute_hs(self.falcon, self.frts_image_paddr, code_off=0x0, data_off=self.desc_v3.IMEMLoadSize,
@@ -338,9 +320,6 @@ class NV_FLCN(NV_IP):
 
   def execute_bootloader(self, base:int, ucode:bytes, start_tag:int, dmem_desc:bytes, ctx_dma:int, mailbox=None):
     self.disable_ctx_req(base)
-    # The IMEM destination must exactly equal start_tag<<8 (nova-core: "dst_start and start_tag<<8 are expected to be
-    # identical values", no correction applied anywhere) -- NOT "top of 64K IMEM minus ucode length". These only
-    # coincide when the firmware's embedded start tag happens to already point exactly len(ucode) below 0x10000.
     self.imem_copy_direct(base, start_tag << 8, ucode, secure=False, tag=start_tag << 8)
     self.dmem_copy_direct(base, 0, dmem_desc)
     self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)[ctx_dma].update(target=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM,
@@ -373,8 +352,6 @@ class NV_FLCN(NV_IP):
   def wait_cpu_halted(self, base):
     try: wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).read_bitfields()['halted'], msg="not halted")
     except TimeoutError:
-      # one-shot diagnostic dump (base+offset per dev_falcon_v4.h, cross-checked against nova-core's regs.rs) -- not a
-      # permanent instrumentation hook, just here to capture register state on a real hang for post-mortem analysis.
       names = {0x000: "IRQSTAT", 0x008: "IRQMASK", 0x040: "MAILBOX0", 0x044: "MAILBOX1", 0x080: "OS", 0x084: "RM",
                0x0f4: "HWCFG2", 0x100: "CPUCTL", 0x104: "BOOTVEC", 0x10c: "DMACTL", 0x118: "DMATRFCMD", 0x12c: "HWCFG1"}
       dump = " ".join(f"{n}={self.nvdev.rreg(base+off):#010x}" for off, n in names.items())
@@ -424,9 +401,6 @@ class NV_FLCN(NV_IP):
 
     wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(base).read_bitfields()['mem_scrubbing'], value=0, msg="Scrubbing not completed")
 
-    # GA100 uses the tu102 dev_riscv_pri register set (see include() in init_sw), which has no BCR_CTRL register at
-    # all -- only CORE_SWITCH_RISCV_STATUS. Skipping the BCR_CTRL dance here is correct by construction, not by
-    # assumption: the register simply doesn't exist in GA100's address map.
     if self.nvdev.fw_name in ("tu102", "ga100"):
       self.nvdev.NV_PFALCON_FALCON_RM.with_base(base).write(self.nvdev.chip_id)
       return
@@ -510,8 +484,6 @@ class NV_GSP(NV_IP):
     self.rpc_set_registry_table()
 
     self.gpfifo_class, self.compute_class, self.dma_class = nv_gpu.AMPERE_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.AMPERE_DMA_COPY_B
-    # GA100 (A100/A30/CMP170HX) is compute-only (no display/graphics engine) and exposes the _A compute/dma classes,
-    # unlike consumer Ampere (GA102 etc.) which exposes _B. Must be checked before the chip_name[:2] "GA" match below.
     if self.nvdev.chip_name == "GA100": self.compute_class, self.dma_class = nv_gpu.AMPERE_COMPUTE_A, nv_gpu.AMPERE_DMA_COPY_A
     match self.nvdev.chip_name[:2]:
       case "AD": self.compute_class = nv_gpu.ADA_COMPUTE_A
@@ -558,9 +530,6 @@ class NV_GSP(NV_IP):
     libos_args_view[:sum(ctypes.sizeof(s) for s in libos_structs)] = b''.join(bytes(s) for s in libos_structs)
 
   def init_gsp_image(self):
-    # NOTE(GA100): nvidia/ga100/gsp/ has no gsp-*.bin of its own (only booter_load/booter_unload/bootloader), so GA100
-    # reuses ga102's GSP-RM image here. The signature section is selected by chip_name[:4] ("GA10"), which both GA100
-    # and GA102 share, resolving to the same .fwsignature_ga10x section -- confirmed present in the GA102 GSP ELF.
     gsp_fw_name = "tu102" if self.nvdev.fw_name == "tu102" else "ga102"
     sha = {"ga102": "a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f",
            "tu102": "3052aee2872182a14d8d7c069e3a14fe4642405894b24692c4aca4101dfb1809"}[gsp_fw_name]
@@ -613,15 +582,7 @@ class NV_GSP(NV_IP):
       m = nv.GspFwWprMeta(**common, vgaWorkspaceSize=0x20000, pmuReservedSize=0x1820000, nonWprHeapSize=0x220000, gspFwHeapSize=0x8700000,
         frtsSize=0x100000)
     else:
-      # GA100 has no FRTS region (kgspGetFrtsSize_HAL returns 0 in NVIDIA's driver -- no display engine, doesn't use
-      # FRTS/WPR2 the way Turing does). frtsOffset = gspFwWprEnd - frtsSize, so frtsSize=0 correctly collapses
-      # frtsOffset to sit exactly at gspFwWprEnd (matching NVIDIA's real formula) without changing any other field's
-      # shape -- nothing else in this layout computation branches on frtsSize.
       frts_sz = 0 if self.nvdev.fw_name == "ga100" else 0x100000
-      # kgspGetFwHeapSize_IMPL / _kgspCalculateFwHeapSize (open-gpu-kernel-modules): heap size is computed dynamically
-      # from usable FB size, not a fixed constant. Verified against a real dmesg capture on this exact GA100 card
-      # (fbSize=0x1000000000 -> heapSize=0x6e00000, matches exactly). HAL constants below (base=8MB, carveout=0,
-      # min=64MB, max=256MB) are shared by the same chip bucket as fw_name in ("tu102","ga100").
       mem_size_gb = round_up(self.nvdev.vram_size, 1 << 30) >> 30
       gsp_heap_sz = min(max((8 << 20) + round_up((96 << 10) * mem_size_gb, 1 << 20) + round_up((48 << 10) * 2048, 1 << 20),
         64 << 20), 256 << 20)
