@@ -103,7 +103,6 @@ class NVDev:
 
     self.include("nv_ref", "")
     self.include("dev_fb", "tu102")
-    self.include("dev_gc6_island", "ga102")
 
     if self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0:
       self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
@@ -117,6 +116,8 @@ class NVDev:
     self.chip_name = CHIP_ARCH_NAMES[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
     self.fw_name = CHIP_FW_NAMES[self.chip_name[:3]]
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
+
+    if self.fw_name != "tu102": self.include("dev_gc6_island", "ga102")
 
     self.flcn:NV_FLCN|NV_FLCN_COT = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
     self.gsp:NV_GSP = NV_GSP(self)
