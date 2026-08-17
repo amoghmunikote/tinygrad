@@ -104,6 +104,19 @@ class NVDev:
     self.include("nv_ref", "")
     self.include("dev_fb", "tu102")
 
+    self.chip_id = self.reg("NV_PMC_BOOT_0").read()
+    self.chip_details = self.reg("NV_PMC_BOOT_42").read_bitfields()
+    self.chip_name = CHIP_ARCH_NAMES[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
+    self.fw_name = CHIP_FW_NAMES[self.chip_name[:3]]
+
+    # Ampere+ gets its fb size from a scratch register that GFW repopulates after a reset. Turing has no GFW and reads the devinit-programmed fb
+    # config instead, which the reset below clears, so sample it while it is still there.
+    if self.fw_name == "tu102":
+      self.include("dev_fb", "gp102")
+      f = self.reg("NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE").read_bitfields()
+      self.vram_size = f['lower_mag'] << (f['lower_scale'] + 20)
+      if f['ecc_mode'] == 1: self.vram_size = self.vram_size // 16 * 15
+
     if self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0:
       self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
       if DEBUG >= 2: print(f"nv {self.devfmt}: WPR2 is up. Issuing a full reset.", flush=True)
@@ -111,13 +124,11 @@ class NVDev:
       time.sleep(0.1) # wait until device can respond again
 
     self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
-    self.chip_id = self.reg("NV_PMC_BOOT_0").read()
-    self.chip_details = self.reg("NV_PMC_BOOT_42").read_bitfields()
-    self.chip_name = CHIP_ARCH_NAMES[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
-    self.fw_name = CHIP_FW_NAMES[self.chip_name[:3]]
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
 
-    if self.fw_name != "tu102": self.include("dev_gc6_island", "ga102")
+    # Turing has no GFW, so the AON scratch regs here are never read on it (see NV_FLCN.wait_for_reset and _early_mmu_init), but the BSI scratch is:
+    # the gsp cpu sequencer's core resume op needs NV_PGC6_BSI_SECURE_SCRATCH_14, which is at the same address with the same field on tu102.
+    self.include("dev_gc6_island", "ga102")
 
     self.flcn:NV_FLCN|NV_FLCN_COT = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
     self.gsp:NV_GSP = NV_GSP(self)
@@ -132,13 +143,8 @@ class NVDev:
     self.pte_t, self.pde_t, self.dual_pde_t = [self.__dict__[name] for name in [f'NV_MMU_VER{self.mmu_ver}_PTE', f'NV_MMU_VER{self.mmu_ver}_PDE',
                                                                                 f'NV_MMU_VER{self.mmu_ver}_DUAL_PDE']]
 
-    if self.fw_name == "tu102":
-      self.include("dev_fb", "gp102")
-      f = self.reg("NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE").read_bitfields()
-      self.vram_size = f['lower_mag'] << (f['lower_scale'] + 20)
-      if f['ecc_mode'] == 1: self.vram_size = self.vram_size // 16 * 15
-    else:
-      self.vram_size = self.reg("NV_PGC6_AON_SECURE_SCRATCH_GROUP_42").read() << 20
+    if self.fw_name != "tu102": self.vram_size = self.reg("NV_PGC6_AON_SECURE_SCRATCH_GROUP_42").read() << 20 # tu102 sampled it pre-reset
+    assert self.vram_size > 0, "failed to read the fb size"
 
     self.vram, self.mmio = self.pci_dev.map_bar(1), self.pci_dev.map_bar(0, fmt='I')
     self.large_bar = self.vram.nbytes >= self.vram_size
@@ -159,7 +165,8 @@ class NVDev:
   def _alloc_boot_mem(self, size:int, data:bytes|None=None, contiguous:bool=False, sysmem:bool|None=None) -> tuple[MMIOInterface,int|None,list[int]]:
     sz = round_up(size, 0x1000)
     if sysmem is True or (sysmem is None and not self.large_bar):
-      view, sysaddr = self.pci_dev.alloc_sysmem(size, 0, contiguous=contiguous)
+      # Pass the page-aligned size: system_paddrs() walks whole pages, so a sub-page size resolves to no addresses at all.
+      view, sysaddr = self.pci_dev.alloc_sysmem(sz, 0, contiguous=contiguous)
       paddr = None
     else:
       paddr = self.mm.palloc(sz, boot=False)

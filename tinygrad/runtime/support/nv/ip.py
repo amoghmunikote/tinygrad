@@ -91,6 +91,8 @@ class NVRpcQueue:
     raise RuntimeError(f"Timeout waiting for RPC response for command {cmd}")
 
 class NV_FLCN(NV_IP):
+  falcon, sec2 = 0x00110000, 0x00840000
+
   def wait_for_reset(self):
     if self.nvdev.fw_name == "tu102": return
     wait_cond(lambda _: self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK.read_bitfields()['read_protection_level0'] == 1 and
@@ -204,11 +206,12 @@ class NV_FLCN(NV_IP):
       secureCodeOff=self.desc_v2.IMEMPhysBase + (self.desc_v2.IMEMSecBase - self.desc_v2.IMEMVirtBase), secureCodeSize=self.desc_v2.IMEMSecSize,
       codeEntryPoint=0, dataDmaBaseLo=lo32(data_dma_base), dataDmaBaseHi=hi32(data_dma_base), dataSize=self.desc_v2.DMEMLoadSize, argc=0, argv=0))
 
-  def prep_booter(self):
-    sha = {"ga102":"4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b",
-           "ad102":"8b293e19b637c5e22c87a2428d1c71bb13e0904e8a88ac6b3c6c1f2679c6e37a",
-           "tu102":"7bb181f544a942299bbf4642da6d9bb58bfed8459725094e2ace56647cd3ec8c"}[self.nvdev.fw_name]
-    h = nv.struct_nvfw_bin_hdr.from_buffer_copy(b:=fetch_fw(f"nvidia/{self.nvdev.fw_name}/gsp", "booter_load-570.144.bin", sha))
+  def _prep_booter_image(self, which:str) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+    sha = {"load": {"ga102":"4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b",
+                    "ad102":"8b293e19b637c5e22c87a2428d1c71bb13e0904e8a88ac6b3c6c1f2679c6e37a",
+                    "tu102":"7bb181f544a942299bbf4642da6d9bb58bfed8459725094e2ace56647cd3ec8c"},
+           }[which][self.nvdev.fw_name]
+    h = nv.struct_nvfw_bin_hdr.from_buffer_copy(b:=fetch_fw(f"nvidia/{self.nvdev.fw_name}/gsp", f"booter_{which}-570.144.bin", sha))
     lh = nv.struct_nvfw_hs_load_header_v2.from_buffer_copy(b, (hs:=nv.struct_nvfw_hs_header_v2.from_buffer_copy(b, h.header_offset)).header_offset)
     app = nv.struct_nvfw_hs_load_header_v2_app.from_buffer_copy(b, hs.header_offset + ctypes.sizeof(nv.struct_nvfw_hs_load_header_v2))
 
@@ -216,20 +219,19 @@ class NV_FLCN(NV_IP):
     sig = b[(sig_off:=hs.sig_prod_offset + patch_sig):sig_off + (sig_len:=hs.sig_prod_size // struct.unpack_from("<I", b, hs.num_sig)[0])]
 
     (patched_image:=bytearray(b[h.data_offset:h.data_offset + h.data_size]))[patch_loc:patch_loc+sig_len] = sig
+    return bytes(patched_image), (lh.os_code_offset, lh.os_code_size, app.offset, app.size, lh.os_data_offset, lh.os_data_size)
+
+  def prep_booter(self):
+    patched_image, offs = self._prep_booter_image("load")
 
     if self.nvdev.fw_name == "tu102":
-      self.booter_image = bytes(patched_image)
-      self.booter_ns_off, self.booter_ns_sz = lh.os_code_offset, lh.os_code_size
-      self.booter_sec_off, self.booter_sec_sz = app.offset, app.size
-      self.booter_data_off, self.booter_data_sz = lh.os_data_offset, lh.os_data_size
+      self.booter_image, self.booter_offs = patched_image, offs
       return
 
     _, self.booter_image_paddr, _ = self.nvdev._alloc_boot_mem(len(patched_image), data=patched_image, sysmem=False)
-    self.booter_data_off, self.booter_data_sz, self.booter_code_off, self.booter_code_sz = lh.os_data_offset, lh.os_data_size, app.offset, app.size
+    self.booter_data_off, self.booter_data_sz, self.booter_code_off, self.booter_code_sz = offs[4], offs[5], offs[2], offs[3]
 
   def init_hw(self):
-    self.falcon, self.sec2 = 0x00110000, 0x00840000
-
     self.reset(self.falcon)
     if self.nvdev.fw_name == "tu102":
       self.execute_bootloader(self.falcon, self.bl_ucode, self.bl_start_tag, self.dmem_desc, ctx_dma=4)
@@ -249,8 +251,7 @@ class NV_FLCN(NV_IP):
     # booter
     self.reset(self.sec2)
     if self.nvdev.fw_name == "tu102":
-      mbx = self.execute_direct(self.sec2, self.booter_image, self.booter_ns_off, self.booter_ns_sz,
-        self.booter_sec_off, self.booter_sec_sz, self.booter_data_off, self.booter_data_sz, mailbox=self.nvdev.gsp.wpr_meta_sysmem)
+      mbx = self.execute_direct(self.sec2, self.booter_image, *self.booter_offs, mailbox=self.nvdev.gsp.wpr_meta_sysmem)
     else:
       mbx = self.execute_hs(self.sec2, self.booter_image_paddr, code_off=self.booter_code_off, data_off=self.booter_data_off,
         imemPa=0x0, imemVa=self.booter_code_off, imemSz=self.booter_code_sz, dmemPa=0x0, dmemVa=0x0, dmemSz=self.booter_data_sz,
@@ -375,7 +376,10 @@ class NV_FLCN(NV_IP):
     time.sleep(0.1)
     engine_reg.write(reset=0)
 
-    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(base).read_bitfields()['mem_scrubbing'], value=0, msg="Scrubbing not completed")
+    # HWCFG2.MEM_SCRUBBING doesn't exist on Turing, it reports imem/dmem scrubbing through DMACTL instead.
+    scrub_reg, scrub_fields = ((self.nvdev.NV_PFALCON_FALCON_DMACTL, ('dmem_scrubbing', 'imem_scrubbing')) if self.nvdev.fw_name == "tu102"
+                               else (self.nvdev.NV_PFALCON_FALCON_HWCFG2, ('mem_scrubbing',)))
+    wait_cond(lambda: any(scrub_reg.with_base(base).read_bitfields()[f] for f in scrub_fields), value=False, msg="Scrubbing not completed")
 
     if self.nvdev.fw_name == "tu102":
       self.nvdev.NV_PFALCON_FALCON_RM.with_base(base).write(self.nvdev.chip_id)
@@ -497,9 +501,10 @@ class NV_GSP(NV_IP):
     libos_args_view, _, libos_addrs = self.nvdev._alloc_boot_mem(0x1000)
     self.libos_args_sysmem = libos_addrs[0]
 
+    # Turing/GA100 run libos2, which only has the init and rm logs. libos3 (Ampere+) adds the rest, incl. the kernel log.
+    logs = ["INIT", "RM"] if self.nvdev.fw_name == "tu102" else ["INIT", "INTR", "RM", "MNOC", "KRNL"]
     libos_structs = [nv.LibosMemoryRegionInitArgument(kind=nv.LIBOS_MEMORY_REGION_CONTIGUOUS, loc=nv.LIBOS_MEMORY_REGION_LOC_SYSMEM, size=0x10000,
-        id8=int.from_bytes(bytes(f"LOG{name}", 'utf-8'), 'big'), pa=logbuf_addrs[0] + 0x10000 * i)
-        for i, name in enumerate(["INIT", "INTR", "RM", "MNOC", "KRNL"])]
+        id8=int.from_bytes(bytes(f"LOG{name}", 'utf-8'), 'big'), pa=logbuf_addrs[0] + 0x10000 * i) for i, name in enumerate(logs)]
     libos_structs.append(nv.LibosMemoryRegionInitArgument(kind=nv.LIBOS_MEMORY_REGION_CONTIGUOUS, loc=nv.LIBOS_MEMORY_REGION_LOC_SYSMEM, size=0x1000,
         id8=int.from_bytes(bytes("RMARGS", 'utf-8'), 'big'), pa=self.rm_args_sysmem))
     libos_args_view[:sum(ctypes.sizeof(s) for s in libos_structs)] = b''.join(bytes(s) for s in libos_structs)
@@ -542,6 +547,13 @@ class NV_GSP(NV_IP):
     _, _, booter_addrs = self.nvdev._alloc_boot_mem(len(self.booter_image), data=self.booter_image)
     self.booter_bar1 = booter_addrs[0]
 
+  def wpr_heap_size(self) -> int:
+    # RM sizes the wpr heap as os_carveout + base + per-gb-of-fb + client alloc reserve, clamped. libos2 (Turing/GA100) has no os carveout and a
+    # lower clamp than libos3 (Ampere+). 0x8100000 is what this works out to for a 24gb libos3 part, which is what the other chips were tuned on.
+    if self.nvdev.fw_name != "tu102": return 0x8100000
+    heap_sz = (8 << 20) + round_up(0x18000 * ceildiv(self.nvdev.vram_size, 1 << 30), 1 << 20) + round_up(0xc000 * 2048, 1 << 20)
+    return min(max(heap_sz, 64 << 20), 256 << 20)
+
   def init_wpr_meta(self):
     self.init_gsp_image()
     self.init_boot_binary_image()
@@ -556,9 +568,10 @@ class NV_GSP(NV_IP):
       m = nv.GspFwWprMeta(**common, vgaWorkspaceSize=0x20000, pmuReservedSize=0x1820000, nonWprHeapSize=0x220000, gspFwHeapSize=0x8700000,
         frtsSize=0x100000)
     else:
+      gsp_heap_sz = self.wpr_heap_size()
       m = nv.GspFwWprMeta(**common, vgaWorkspaceSize=(vga_sz:=0x100000), vgaWorkspaceOffset=(vga_off:=self.nvdev.vram_size-vga_sz),
         gspFwWprEnd=vga_off, frtsSize=(frts_sz:=0x100000), frtsOffset=(frts_off:=vga_off-frts_sz), bootBinOffset=(boot_off:=frts_off-boot_sz),
-        gspFwOffset=(gsp_off:=round_down(boot_off-radix3_sz, 0x10000)), gspFwHeapSize=(gsp_heap_sz:=0x8100000), fbSize=self.nvdev.vram_size,
+        gspFwOffset=(gsp_off:=round_down(boot_off-radix3_sz, 0x10000)), gspFwHeapSize=gsp_heap_sz, fbSize=self.nvdev.vram_size,
         gspFwHeapOffset=(gsp_heap_off:=round_down(gsp_off-gsp_heap_sz, 0x100000)), gspFwWprStart=(wpr_st:=round_down(gsp_heap_off-0x1000, 0x100000)),
         nonWprHeapSize=(non_wpr_sz:=0x100000), nonWprHeapOffset=(non_wpr_off:=round_down(wpr_st-non_wpr_sz, 0x100000)), gspFwRsvdStart=non_wpr_off)
       assert self.nvdev.flcn.frts_offset == m.frtsOffset, f"FRTS mismatch: {self.nvdev.flcn.frts_offset} != {m.frtsOffset}"
