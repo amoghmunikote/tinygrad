@@ -690,8 +690,10 @@ class NVDevice(HCQCompiled[NVSignal]):
 
   def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False) -> GPFifo:
     notifier = self.iface.alloc(48 << 20, uncached=True)
+    vid_legacy = video and ctxshare == 0
     params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(gpFifoOffset=gpfifo_area.va_addr+offset, gpFifoEntries=entries, hContextShare=ctxshare,
-      hObjectError=notifier.meta.hMemory, hObjectBuffer=self.virtmem if (video and ctxshare == 0) else gpfifo_area.meta.hMemory,
+      hObjectError=notifier.meta.hMemory, hObjectBuffer=0 if vid_legacy else gpfifo_area.meta.hMemory,
+      hVASpace=self.vaspace if vid_legacy else 0,
       hUserdMemory=(ctypes.c_uint32*8)(gpfifo_area.meta.hMemory), userdOffset=(ctypes.c_uint64*8)(entries*8+offset), engineType=19 if video else 0)
     gpfifo = self.iface.rm_alloc(channel_group, self.iface.gpfifo_class, params)
 
@@ -765,10 +767,7 @@ class NVDevice(HCQCompiled[NVSignal]):
     filter_size = round_up(round_up(self.intra_top_off, 0x10000) + (64 << 10) + intra_unk_size, 2 << 20)
 
     if not hasattr(self, 'vid_gpfifo'):
-      if not self.is_nvd():
-        self.vid_gpfifo = self._new_gpu_fifo(self.gpfifo_area, self.ctxshare, self.channel_group, offset=0x200000, entries=2048, compute=False, video=True)
-      else:
-        self.vid_gpfifo = self._new_gpu_fifo(self.gpfifo_area, 0, self.nvdevice, offset=0x200000, entries=2048, compute=False, video=True)
+      self.vid_gpfifo = self._new_gpu_fifo(self.gpfifo_area, 0, self.nvdevice, offset=0x200000, entries=2048, compute=False, video=True)
       self.vid_coloc_buf, self.vid_filter_buf = self.allocator.alloc(coloc_size), self.allocator.alloc(filter_size)
       self.vid_stat_buf = self.allocator.alloc(0x1000)
       NVVideoQueue().wait(self.timeline_signal, self.timeline_value - 1) \
