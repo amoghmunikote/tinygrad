@@ -662,7 +662,8 @@ class NVDevice(HCQCompiled[NVSignal]):
       map_flags=(nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23))
 
     ctxshare_params = nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=self.vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC)
-    ctxshare = self.iface.rm_alloc(self.channel_group, nv_gpu.FERMI_CONTEXT_SHARE_A, ctxshare_params)
+    self.ctxshare = self.iface.rm_alloc(self.channel_group, nv_gpu.FERMI_CONTEXT_SHARE_A, ctxshare_params)
+    ctxshare = self.ctxshare
 
     self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)
     self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0x100000, entries=0x10000, compute=False)
@@ -699,8 +700,7 @@ class NVDevice(HCQCompiled[NVSignal]):
       debugger_params = nv_gpu.NV83DE_ALLOC_PARAMETERS(hAppClient=self.iface.root, hClass3dObject=self.debug_compute_obj)
       self.debugger = self.iface.rm_alloc(self.nvdevice, nv_gpu.GT200_DEBUGGER, debugger_params)
     elif not video: self.iface.rm_alloc(gpfifo, self.iface.dma_class)
-    else: self.iface.rm_alloc(gpfifo, self.iface.viddec_class,
-            nv_gpu.NV_BSP_ALLOCATION_PARAMETERS(size=nv_gpu.NV_BSP_ALLOCATION_PARAMETERS.SIZE, prohibitMultipleInstances=0, engineInstance=0))
+    else: self.iface.rm_alloc(gpfifo, self.iface.viddec_class)
 
     if channel_group == self.nvdevice:
       self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_BIND, nv_gpu.NVA06F_CTRL_BIND_PARAMS(engineType=params.engineType))
@@ -766,12 +766,7 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     if not hasattr(self, 'vid_gpfifo'):
       if not self.is_nvd():
-        vid_tsg = self.iface.rm_alloc(self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A,
-          nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_BSP))
-        vid_ctxshare = self.iface.rm_alloc(vid_tsg, nv_gpu.FERMI_CONTEXT_SHARE_A,
-          nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=self.vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC))
-        self.vid_gpfifo = self._new_gpu_fifo(self.gpfifo_area, vid_ctxshare, vid_tsg, offset=0x200000, entries=2048, compute=False, video=True)
-        self.iface.rm_control(vid_tsg, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
+        self.vid_gpfifo = self._new_gpu_fifo(self.gpfifo_area, self.ctxshare, self.channel_group, offset=0x200000, entries=2048, compute=False, video=True)
       else:
         self.vid_gpfifo = self._new_gpu_fifo(self.gpfifo_area, 0, self.nvdevice, offset=0x200000, entries=2048, compute=False, video=True)
       self.vid_coloc_buf, self.vid_filter_buf = self.allocator.alloc(coloc_size), self.allocator.alloc(filter_size)
