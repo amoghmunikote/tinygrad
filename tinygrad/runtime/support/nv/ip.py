@@ -374,7 +374,16 @@ class NV_FLCN(NV_IP):
       self.nvdev.wreg(base + self.nvdev.NV_PFALCON_FALCON_CPUCTL_ALIAS, 0x2)
     else: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).write(startcpu=1)
 
-  def wait_cpu_halted(self, base): wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).read_bitfields()['halted'], msg="not halted")
+  def wait_cpu_halted(self, base):
+    try: wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).read_bitfields()['halted'], msg="not halted")
+    except TimeoutError:
+      # one-shot diagnostic dump (base+offset per dev_falcon_v4.h, cross-checked against nova-core's regs.rs) -- not a
+      # permanent instrumentation hook, just here to capture register state on a real hang for post-mortem analysis.
+      names = {0x000: "IRQSTAT", 0x008: "IRQMASK", 0x040: "MAILBOX0", 0x044: "MAILBOX1", 0x080: "OS", 0x084: "RM",
+               0x0f4: "HWCFG2", 0x100: "CPUCTL", 0x104: "BOOTVEC", 0x10c: "DMACTL", 0x118: "DMATRFCMD", 0x12c: "HWCFG1"}
+      dump = " ".join(f"{n}={self.nvdev.rreg(base+off):#010x}" for off, n in names.items())
+      print(f"wait_cpu_halted TIMEOUT @ base={base:#x}: {dump}")
+      raise
 
   def execute_hs(self, base, img_paddr, code_off, data_off, imemPa, imemVa, imemSz, dmemPa, dmemVa, dmemSz, pkc_off, engid, ucodeid, mailbox=None):
     self.disable_ctx_req(base)
