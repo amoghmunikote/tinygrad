@@ -92,7 +92,6 @@ class NVRpcQueue:
 
 class NV_FLCN(NV_IP):
   def wait_for_reset(self):
-    # Turing has no GFW; the GPU is in a clean state after the WPR2 check in _early_ip_init.
     if self.nvdev.fw_name == "tu102": return
     wait_cond(lambda _: self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK.read_bitfields()['read_protection_level0'] == 1 and
                         self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05[0].read() & 0xff == 0xff, "waiting for reset")
