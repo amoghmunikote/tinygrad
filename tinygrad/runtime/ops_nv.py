@@ -679,8 +679,13 @@ class NVDevice(HCQCompiled[NVSignal]):
       'num_tpc_per_gpc', 'num_sm_per_tpc', 'max_warps_per_sm', 'sm_version')
 
     # FIXME: no idea how to convert this for blackwells
-    self.arch: str = "sm_120" if self.sm_version==0xa04 else f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
-    self.sass_version = ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
+    # GA100's RM reports SM version 0x802 ("SM 8.02" internal stepping) but its public CUDA compute capability is sm_80.
+    # Every other chip has a lower byte matching the public CUDA minor version; 0x802 is the only outlier.
+    if self.sm_version == 0x802:
+      self.arch, self.sass_version = "sm_80", 0x80
+    else:
+      self.arch = "sm_120" if self.sm_version==0xa04 else f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
+      self.sass_version = ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
 
     super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], NVProgram, NVSignal, NVComputeQueue,
                      NVCopyQueue, arch=self.arch)
