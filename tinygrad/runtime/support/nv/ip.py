@@ -212,13 +212,9 @@ class NV_FLCN(NV_IP):
   def prep_frts_bootloader(self, image:bytes):
     assert self.desc_v2.DMEMPhysBase == 0, "generic bootloader always loads DMEM at destination offset 0"
 
-    # NOTE(GA100): confirmed on real hardware (CMP 170HX) that GA100's VBIOS FWSEC descriptor is V2, so it DOES take
-    # this generic-bootloader path like Turing (an earlier assumption here, that GA100 skips FWSEC-FRTS entirely, was
-    # wrong -- corrected after testing). linux-firmware's nvidia/ga100/gsp/ has no gen_bootloader-*.bin of its own
-    # though (confirmed via directory listing), so this reuses tu102's -- the stub is a tiny, chip-generic PIO-loader
-    # whose only job is DMA'ing the real FWSEC-FRTS image from sysmem, plausibly identical across no-BROM chips.
-    # This is a tested hypothesis, not a confirmed NVIDIA guarantee -- if wrong, expect a loud mailbox/hang failure
-    # downstream, not silent corruption.
+    # NOTE: this function is not reached for GA100 -- init_sw() skips prep_ucode() entirely for GA100 because
+    # kgspGetFrtsSize_HAL returns 0 for it (no display engine, no FRTS/WPR2 pre-init needed). If GA100 ever takes
+    # this path, it would need tu102's gen_bootloader (no nvidia/ga100/gsp/gen_bootloader-*.bin in linux-firmware).
     gen_bl_fw_name = "tu102"
     sha = {"tu102": "b37776a511b4a00901e4e3ac568db917086d3bf439f85bc9b3e4adc7338a0aff"}[gen_bl_fw_name]
     h = nv.struct_nvfw_bin_hdr.from_buffer_copy(b:=fetch_fw(f"nvidia/{gen_bl_fw_name}/gsp", "gen_bootloader-570.144.bin", sha))
@@ -428,8 +424,9 @@ class NV_FLCN(NV_IP):
 
     wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(base).read_bitfields()['mem_scrubbing'], value=0, msg="Scrubbing not completed")
 
-    # GA100 is assumed to skip the RISC-V BCR_CTRL dance like Turing (no BROM), following from "no BROM" the same way
-    # Turing does -- but this is not yet confirmed against real GA100 register traces; re-check first if boot hangs here.
+    # GA100 uses the tu102 dev_riscv_pri register set (see include() in init_sw), which has no BCR_CTRL register at
+    # all -- only CORE_SWITCH_RISCV_STATUS. Skipping the BCR_CTRL dance here is correct by construction, not by
+    # assumption: the register simply doesn't exist in GA100's address map.
     if self.nvdev.fw_name in ("tu102", "ga100"):
       self.nvdev.NV_PFALCON_FALCON_RM.with_base(base).write(self.nvdev.chip_id)
       return
@@ -561,11 +558,9 @@ class NV_GSP(NV_IP):
     libos_args_view[:sum(ctypes.sizeof(s) for s in libos_structs)] = b''.join(bytes(s) for s in libos_structs)
 
   def init_gsp_image(self):
-    # NOTE(GA100): confirmed via linux-firmware directory listing that nvidia/ga100/gsp/ has no gsp-*.bin of its
-    # own -- only booter_load/booter_unload/bootloader. GA100 correctly falls through to reuse ga102's GSP-RM image
-    # here. Its signature section is selected below via chip_name[:4] ("GA10"), which GA100 and GA102 share, so this
-    # should resolve to the same shared .fwsignature_ga10x section GA102 already uses -- unverified against real
-    # hardware, but consistent with GA100 having no separate GSP-RM firmware image to carry its own signature.
+    # NOTE(GA100): nvidia/ga100/gsp/ has no gsp-*.bin of its own (only booter_load/booter_unload/bootloader), so GA100
+    # reuses ga102's GSP-RM image here. The signature section is selected by chip_name[:4] ("GA10"), which both GA100
+    # and GA102 share, resolving to the same .fwsignature_ga10x section -- confirmed present in the GA102 GSP ELF.
     gsp_fw_name = "tu102" if self.nvdev.fw_name == "tu102" else "ga102"
     sha = {"ga102": "a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f",
            "tu102": "3052aee2872182a14d8d7c069e3a14fe4642405894b24692c4aca4101dfb1809"}[gsp_fw_name]
