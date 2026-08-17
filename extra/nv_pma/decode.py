@@ -37,6 +37,21 @@ STALL_KEY_MAP_AMPERE: dict[int, StallReason] = {
   18: StallReason.NONE,
 }
 
+STALL_KEY_MAP_TURING: dict[int, StallReason] = {
+  # sm_75 (Turing) stall key → reason mapping.
+  # Turing reshuffled several keys vs. Ampere. Needs calibration against CUPTI on Turing hardware.
+  1: StallReason.MEMORY_THROTTLE, 2: StallReason.MEMORY_THROTTLE,  # lg_throttle, drain
+  3: StallReason.PIPE_BUSY, 4: StallReason.PIPE_BUSY,              # mio_throttle, math_pipe_throttle
+  5: StallReason.SYNC, 6: StallReason.SYNC,                         # membar, barrier
+  7: StallReason.EXEC_DEPENDENCY, 8: StallReason.EXEC_DEPENDENCY,  # wait, short_scoreboard
+  9: StallReason.MEMORY_DEPENDENCY,                                  # long_scoreboard
+  11: StallReason.TEXTURE,                                           # tex_throttle
+  12: StallReason.INST_FETCH, 13: StallReason.INST_FETCH,           # no_instructions, branch_resolving
+  14: StallReason.SLEEPING,
+  15: StallReason.OTHER, 16: StallReason.OTHER,                     # misc, dispatch_stall
+  18: StallReason.NONE,                                              # selected_not_issued
+}
+
 STALL_KEY_MAP_BLACKWELL: dict[int, StallReason] = {
   0x01: StallReason.MEMORY_THROTTLE, 0x0e: StallReason.MEMORY_THROTTLE,
   0x02: StallReason.SYNC,
@@ -64,7 +79,7 @@ class PMAHeader(PacketType):
   def tpc_id(self) -> int: return self.tpc_id_lo | (self.tpc_id_hi << 8)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 8-BYTE SAMPLE FORMAT (Ampere/Ada/Hopper)
+# 8-BYTE SAMPLE FORMAT (Turing / Ampere / Ada / Hopper)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PMASampleAmpere8B(PacketType):
@@ -76,6 +91,10 @@ class PMASampleAmpere8B(PacketType):
   def pc_offset(self) -> int: return self.pc_raw << 4
   @property
   def stall_reason(self) -> StallReason: return STALL_KEY_MAP_AMPERE.get(self.stall_key, StallReason.OTHER)
+
+class PMASampleTuring8B(PMASampleAmpere8B):
+  @property
+  def stall_reason(self) -> StallReason: return STALL_KEY_MAP_TURING.get(self.stall_key, StallReason.OTHER)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 9-BYTE SAMPLE FORMAT (Blackwell+)
@@ -94,12 +113,14 @@ class PMASampleBlackwell9B(PacketType):
   @property
   def wave_id(self) -> int: return (self.wave_hi << 4) | self.wave_lo
 
-PMASample = PMASampleAmpere8B|PMASampleBlackwell9B
+PMASample = PMASampleTuring8B|PMASampleAmpere8B|PMASampleBlackwell9B
 
 def decode(data: bytes, sm_version: int = 0x800) -> Iterator[tuple[PMASample, int]]:
   use_9byte = sm_version >= 0xa04
   record_size = 9 if use_9byte else 8
-  sample_cls = PMASampleBlackwell9B if use_9byte else PMASampleAmpere8B
+  if use_9byte: sample_cls = PMASampleBlackwell9B
+  elif sm_version < 0x800: sample_cls = PMASampleTuring8B  # sm_75 and below
+  else: sample_cls = PMASampleAmpere8B
 
   tpc_state: dict[int, list[int]] = collections.defaultdict(list)
   for pkt_idx in range(len(data) // 32):
