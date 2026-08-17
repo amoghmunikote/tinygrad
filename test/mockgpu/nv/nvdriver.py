@@ -130,7 +130,8 @@ class NVDriver(VirtDriver):
       gpu = parent.device if isinstance(parent, NVChannelGroup) else parent
       gpfifo_token = gpu.add_gpfifo(params.gpFifoOffset, params.gpFifoEntries)
       self.object_by_handle[struct.hObjectNew] = NVGPFIFO(gpu, gpfifo_token)
-    elif struct.hClass in (nv_gpu.AMPERE_DMA_COPY_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.NVC9B0_VIDEO_DECODER, nv_gpu.NVCFB0_VIDEO_DECODER):
+    elif struct.hClass in (nv_gpu.AMPERE_DMA_COPY_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.NVC4B0_VIDEO_DECODER, nv_gpu.NVC9B0_VIDEO_DECODER,
+                           nv_gpu.NVCFB0_VIDEO_DECODER):
       assert struct.hObjectParent in self.object_by_handle and isinstance(self.object_by_handle[struct.hObjectParent], NVGPFIFO)
       struct.hObjectNew = self._alloc_handle()
       gpfifo = self.object_by_handle[struct.hObjectParent]

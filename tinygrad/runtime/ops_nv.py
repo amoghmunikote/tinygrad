@@ -651,9 +651,9 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     vaspace_params = nv_gpu.NV_VASPACE_ALLOCATION_PARAMETERS(vaBase=0x1000, vaSize=0x1fffffb000000,
       flags=nv_gpu.NV_VASPACE_ALLOCATION_FLAGS_ENABLE_PAGE_FAULTING | nv_gpu.NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED)
-    self.vaspace = self.iface.rm_alloc(self.nvdevice, nv_gpu.FERMI_VASPACE_A, vaspace_params)
+    vaspace = self.iface.rm_alloc(self.nvdevice, nv_gpu.FERMI_VASPACE_A, vaspace_params)
 
-    self.iface.setup_vm(self.vaspace)
+    self.iface.setup_vm(vaspace)
 
     channel_params = nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS)
     self.channel_group = self.iface.rm_alloc(self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A, channel_params)
@@ -661,9 +661,8 @@ class NVDevice(HCQCompiled[NVSignal]):
     self.gpfifo_area = self.iface.alloc(0x300000, contiguous=True, cpu_access=True, force_devmem=True,
       map_flags=(nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23))
 
-    ctxshare_params = nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=self.vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC)
-    self.ctxshare = self.iface.rm_alloc(self.channel_group, nv_gpu.FERMI_CONTEXT_SHARE_A, ctxshare_params)
-    ctxshare = self.ctxshare
+    ctxshare_params = nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC)
+    ctxshare = self.iface.rm_alloc(self.channel_group, nv_gpu.FERMI_CONTEXT_SHARE_A, ctxshare_params)
 
     self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)
     self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0x100000, entries=0x10000, compute=False)
@@ -690,10 +689,10 @@ class NVDevice(HCQCompiled[NVSignal]):
 
   def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False) -> GPFifo:
     notifier = self.iface.alloc(48 << 20, uncached=True)
-    vid_legacy = video and ctxshare == 0
+    # NVDEC channels must not use the UVM-owned (externally owned) vaspace: RM skips mapping the engine ctx buffer for it and UVM never maps it
+    # for video engines, so the channel would run with an invalid ctx. Use the RM-managed vaspace, which _gpu_uvm_map also maps every buffer into.
     params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(gpFifoOffset=gpfifo_area.va_addr+offset, gpFifoEntries=entries, hContextShare=ctxshare,
-      hObjectError=notifier.meta.hMemory, hObjectBuffer=0 if vid_legacy else gpfifo_area.meta.hMemory,
-      hVASpace=self.vaspace if vid_legacy else 0,
+      hObjectError=notifier.meta.hMemory, hObjectBuffer=self.virtmem if video else gpfifo_area.meta.hMemory,
       hUserdMemory=(ctypes.c_uint32*8)(gpfifo_area.meta.hMemory), userdOffset=(ctypes.c_uint64*8)(entries*8+offset), engineType=19 if video else 0)
     gpfifo = self.iface.rm_alloc(channel_group, self.iface.gpfifo_class, params)
 
@@ -710,7 +709,7 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     ws_token_params = self.iface.rm_control(gpfifo, nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
       nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1))
-    if ctxshare != 0 and not video: self.iface.setup_gpfifo_vm(gpfifo)
+    if ctxshare != 0: self.iface.setup_gpfifo_vm(gpfifo)
 
     return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=ws_token_params.workSubmitToken,
                   gpput=gpfifo_area.cpu_view().view(offset + entries*8 + getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, fmt='I'))
@@ -764,7 +763,10 @@ class NVDevice(HCQCompiled[NVSignal]):
     self.intra_top_off = round_up(h, 64) * (608 + 4864 + 152 + 2000)
     intra_unk_size = ((2 << 20) if self.iface.viddec_class >= nv_gpu.NVCFB0_VIDEO_DECODER else 0)
     self.intra_unk_off = (round_up(self.intra_top_off, 0x10000) + (64 << 10)) if intra_unk_size > 0 else None
-    filter_size = round_up(round_up(self.intra_top_off, 0x10000) + (64 << 10) + intra_unk_size, 2 << 20)
+    # Turing applies HevcFltAboveOffset/HevcSaoAboveOffset from the picture setup relative to the intra top buffer rather than to the filter
+    # buffer, so reserve a second intra top sized region for them. viddec_class is only ever one of NVCFB0/NVC9B0/NVC4B0, so this picks Turing.
+    above_size = round_up(self.intra_top_off, 0x10000) if self.iface.viddec_class <= nv_gpu.NVC4B0_VIDEO_DECODER else 0
+    filter_size = round_up(round_up(self.intra_top_off, 0x10000) + above_size + (64 << 10) + intra_unk_size, 2 << 20)
 
     if not hasattr(self, 'vid_gpfifo'):
       self.vid_gpfifo = self._new_gpu_fifo(self.gpfifo_area, 0, self.nvdevice, offset=0x200000, entries=2048, compute=False, video=True)
@@ -791,10 +793,15 @@ class NVDevice(HCQCompiled[NVSignal]):
     # TODO: Restore the GPU using NV83DE_CTRL_CMD_CLEAR_ALL_SM_ERROR_STATES if needed.
 
     report = []
-    sm_errors = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES,
-      nv_gpu.NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS(hTargetChannel=self.debug_channel, numSMsToRead=100))
+    # The debugger only covers the graphics engine, so this control fails when another engine (e.g. the video channel) is the one that hung.
+    # Report that instead of masking the real hang behind the debugger's own error.
+    try:
+      sm_errors = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES,
+        nv_gpu.NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS(hTargetChannel=self.debug_channel, numSMsToRead=100))
+    except RuntimeError as err: sm_errors, report = None, [f"graphics debugger state unavailable ({err})"]
 
-    if sm_errors.mmuFault.valid:
+    if sm_errors is None: pass
+    elif sm_errors.mmuFault.valid:
       mmu = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_MMU_FAULT_INFO,
         nv_gpu.NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_PARAMS())
       for i in range(mmu.count):
@@ -804,6 +811,7 @@ class NVDevice(HCQCompiled[NVSignal]):
       for i, e in enumerate(sm_errors.smErrorStateArray):
         if e.hwwGlobalEsr or e.hwwWarpEsr: report += [f"SM {i} fault: esr={e.hwwGlobalEsr} warp_esr={e.hwwWarpEsr:#x} warp_pc={e.hwwWarpEsrPc64:#x}"]
 
+    if not report: report = ["no fault state reported by the graphics debugger, check dmesg for Xid errors on other engines"]
     raise RuntimeError("\n".join(report))
 
   def _prof_init(self):
