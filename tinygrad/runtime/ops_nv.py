@@ -700,7 +700,7 @@ class NVDevice(HCQCompiled[NVSignal]):
       debugger_params = nv_gpu.NV83DE_ALLOC_PARAMETERS(hAppClient=self.iface.root, hClass3dObject=self.debug_compute_obj)
       self.debugger = self.iface.rm_alloc(self.nvdevice, nv_gpu.GT200_DEBUGGER, debugger_params)
     elif not video: self.iface.rm_alloc(gpfifo, self.iface.dma_class)
-    else: self.iface.rm_alloc(gpfifo, self.iface.viddec_class)
+    else: self.iface.rm_alloc(gpfifo, self.iface.viddec_class, nv_gpu.NV_BSP_ALLOCATION_PARAMETERS(size=nv_gpu.NV_BSP_ALLOCATION_PARAMETERS.SIZE))
 
     if channel_group == self.nvdevice:
       self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_BIND, nv_gpu.NVA06F_CTRL_BIND_PARAMS(engineType=params.engineType))
@@ -708,7 +708,7 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     ws_token_params = self.iface.rm_control(gpfifo, nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
       nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1))
-    if ctxshare != 0: self.iface.setup_gpfifo_vm(gpfifo)
+    if ctxshare != 0 and not video: self.iface.setup_gpfifo_vm(gpfifo)
 
     return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=ws_token_params.workSubmitToken,
                   gpput=gpfifo_area.cpu_view().view(offset + entries*8 + getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, fmt='I'))
