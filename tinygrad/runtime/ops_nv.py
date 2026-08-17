@@ -353,7 +353,9 @@ class NVProgram(HCQProgram['NVDevice']):
       qmd = {'qmd_major_version':3 if dev.iface.compute_class >= nv_gpu.AMPERE_COMPUTE_A else 2,
         'sm_global_caching_enable':1, 'program_address_upper':hi32(prog_addr), 'program_address_lower':lo32(prog_addr),
         'shared_memory_size':smem_size, 'register_count_v':self.regs_usage}
-      if dev.iface.compute_class >= nv_gpu.AMPERE_COMPUTE_A:
+      # GA100 (AMPERE_COMPUTE_A) follows Turing's convention: local memory lives in LOW_SIZE, HIGH_SIZE unused.
+      # GA102+ (AMPERE_COMPUTE_B) swapped to HIGH_SIZE for NVCC kernels; NAK still uses LOW_SIZE on all.
+      if dev.iface.compute_class >= nv_gpu.AMPERE_COMPUTE_B:
         qmd[f'shader_local_memory_{"low" if NAK else "high"}_size'] = self.dev.slm_per_thread
       else:
         qmd['shader_local_memory_low_size'], qmd['shader_local_memory_high_size'] = self.dev.slm_per_thread, 0
