@@ -163,7 +163,7 @@ class NVComputeQueue(NVCommandQueue):
     if self.active_qmd is None:
       if prg.dev.pma_enabled: self.nvm(1, nv_gpu.NVC6C0_PM_TRIGGER, 0)
       self.nvm(1, nv_gpu.NVC6C0_SEND_PCAS_A, qmd_buf.va_addr >> 8)
-      if prg.dev.iface.compute_class <= nv_gpu.TURING_COMPUTE_A:
+      if prg.dev.iface.compute_class < nv_gpu.AMPERE_COMPUTE_B:
         self.nvm(1, nv_gpu.NVC6C0_SEND_SIGNALING_PCAS_B, nv_flags("NVC6C0_SEND_SIGNALING_PCAS_B", invalidate="true", schedule="true"))
       else:
         self.nvm(1, nv_gpu.NVC6C0_SEND_SIGNALING_PCAS2_B, 9)
