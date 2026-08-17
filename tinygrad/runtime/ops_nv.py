@@ -173,7 +173,12 @@ class NVComputeQueue(NVCommandQueue):
     else:
       self.active_qmd.write(dependent_qmd0_pointer=qmd_buf.va_addr >> 8, dependent_qmd0_action=1, dependent_qmd0_prefetch=1, dependent_qmd0_enable=1)
 
-    self.active_qmd, self.active_qmd_buf = qmd, qmd_buf
+    # GA100 (AMPERE_COMPUTE_A) QMD release semaphore never fires; use the GPFIFO semaphore
+    # path in signal() instead by not setting active_qmd.
+    if prg.dev.iface.compute_class != nv_gpu.AMPERE_COMPUTE_A:
+      self.active_qmd, self.active_qmd_buf = qmd, qmd_buf
+    else:
+      self.active_qmd = None
     return self
 
   def signal(self, signal:HCQSignal, value:sint=0):
