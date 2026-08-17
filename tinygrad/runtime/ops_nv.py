@@ -46,6 +46,7 @@ class QMD:
   VER_PREFIXES = {5: "NVCEC0_QMDV05_00", 3: "NVC6C0_QMDV03_00", 2: "NVC6C0_QMDV02_03"}
 
   def __init__(self, dev:NVDevice, view:MMIOInterface|None=None, **kwargs):
+    self.compute_class = dev.iface.compute_class
     if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A: self.ver, self.sz = 5, 0x60
     # AMPERE_COMPUTE_A < AMPERE_COMPUTE_B numerically, so this threshold already covers GA100 (_A) and GA102 (_B) alike.
     elif dev.iface.compute_class >= nv_gpu.AMPERE_COMPUTE_A: self.ver, self.sz = 3, 0x40
@@ -160,7 +161,11 @@ class NVComputeQueue(NVCommandQueue):
     self.bind_sints_to_mem(local_size[2], mem=qmd_buf.cpu_view(), fmt='B', offset=qmd.field_offset('cta_thread_dimension2'))
     qmd.set_constant_buf_addr(0, args_state.buf.va_addr)
 
-    if self.active_qmd is None:
+    if self.active_qmd is None or prg.dev.iface.compute_class == nv_gpu.AMPERE_COMPUTE_A:
+      # GA100: dependent QMD chaining is never visible to the compute-engine WFI, so we drain
+      # the previous kernel explicitly and dispatch each kernel independently via PCAS.
+      if prg.dev.iface.compute_class == nv_gpu.AMPERE_COMPUTE_A and self.active_qmd is not None:
+        self.nvm(1, nv_gpu.NVC6C0_WAIT_FOR_IDLE, 0)
       if prg.dev.pma_enabled: self.nvm(1, nv_gpu.NVC6C0_PM_TRIGGER, 0)
       self.nvm(1, nv_gpu.NVC6C0_SEND_PCAS_A, qmd_buf.va_addr >> 8)
       if prg.dev.iface.compute_class < nv_gpu.AMPERE_COMPUTE_B:
@@ -173,16 +178,12 @@ class NVComputeQueue(NVCommandQueue):
     else:
       self.active_qmd.write(dependent_qmd0_pointer=qmd_buf.va_addr >> 8, dependent_qmd0_action=1, dependent_qmd0_prefetch=1, dependent_qmd0_enable=1)
 
-    # GA100 (AMPERE_COMPUTE_A) QMD release semaphore never fires; use the GPFIFO semaphore
-    # path in signal() instead by not setting active_qmd.
-    if prg.dev.iface.compute_class != nv_gpu.AMPERE_COMPUTE_A:
-      self.active_qmd, self.active_qmd_buf = qmd, qmd_buf
-    else:
-      self.active_qmd = None
+    self.active_qmd, self.active_qmd_buf = qmd, qmd_buf
     return self
 
   def signal(self, signal:HCQSignal, value:sint=0):
-    if self.active_qmd is not None:
+    # GA100 QMD release semaphore (RELEASE0) never fires; use the compute-engine WFI + GPFIFO path instead.
+    if self.active_qmd is not None and self.active_qmd.compute_class != nv_gpu.AMPERE_COMPUTE_A:
       for i in range(2):
         names = self.active_qmd.signal_field_names(i)
         if self.active_qmd.read(names['enable']) == 0:
@@ -201,6 +202,8 @@ class NVComputeQueue(NVCommandQueue):
             self.bind_sints_to_mem(value >> 32, mem=self.active_qmd_buf.cpu_view(), fmt='I', offset=val_off+4)
           return self
 
+    # GA100 or no active QMD: wait for all in-flight SKED work to drain, then write signal via GPFIFO.
+    if self.active_qmd is not None: self.nvm(1, nv_gpu.NVC6C0_WAIT_FOR_IDLE, 0)
     self.nvm(0, nv_gpu.NVC56F_SEM_ADDR_LO, *data64_le(signal.value_addr), *data64_le(value),
              nv_flags("NVC56F_SEM_EXECUTE", operation="release", release_wfi="en", payload_size="64bit", release_timestamp="en"))
     self.nvm(0, nv_gpu.NVC56F_NON_STALL_INTERRUPT, 0x0)
