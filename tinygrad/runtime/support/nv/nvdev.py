@@ -116,8 +116,6 @@ class NVDev:
       self.vram_size = f['lower_mag'] << (f['lower_scale'] + 20)
       if f['ecc_mode'] == 1: self.vram_size = self.vram_size // 16 * 15
 
-    # Stage-0 harness hook: NV_FORCE_RESET=1 forces the PCI reset unconditionally so the N-run measurement removes this hidden per-run variable
-    # (whether a previous run left WPR2 set is otherwise the biggest control-flow branch that varies between runs).
     self.reset_fired = self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0 or bool(getenv("NV_FORCE_RESET"))
     if self.reset_fired:
       self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
@@ -143,7 +141,7 @@ class NVDev:
     self.pte_t, self.pde_t, self.dual_pde_t = [self.__dict__[name] for name in [f'NV_MMU_VER{self.mmu_ver}_PTE', f'NV_MMU_VER{self.mmu_ver}_PDE',
                                                                                 f'NV_MMU_VER{self.mmu_ver}_DUAL_PDE']]
 
-    if self.fw_name != "tu102": self.vram_size = self.reg("NV_PGC6_AON_SECURE_SCRATCH_GROUP_42").read() << 20 # tu102 sampled it pre-reset
+    if self.fw_name != "tu102": self.vram_size = self.reg("NV_PGC6_AON_SECURE_SCRATCH_GROUP_42").read() << 20
     assert self.vram_size > 0, "failed to read the fb size"
 
     self.vram, self.mmio = self.pci_dev.map_bar(1), self.pci_dev.map_bar(0, fmt='I')

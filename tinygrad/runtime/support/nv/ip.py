@@ -175,7 +175,7 @@ class NV_FLCN(NV_IP):
       dmem.init_cmd = cmd_id
       patched_image[dmem_mapper_offset : dmem_mapper_offset+len(bytes(dmem))] = bytes(dmem)
       patched_image[(cmd_off:=imem_load_size+dmem.cmd_in_buffer_offset) : cmd_off+len(cmd)] = cmd
-      if pkc_data_offset is not None: # V2 (no BROM/PKC) has no signature to embed; see prep_frts_bootloader()
+      if pkc_data_offset is not None:
         patched_image[(sig_off:=imem_load_size+pkc_data_offset) : sig_off+0x180] = signature[-0x180:]
 
       return bytes(patched_image)
@@ -202,7 +202,7 @@ class NV_FLCN(NV_IP):
     code_dma_base = sysaddrs[0]
     data_dma_base = code_dma_base + align_padding + self.desc_v2.DMEMOffset
 
-    self.dmem_desc = bytes(nv.RM_FLCN_BL_DMEM_DESC(ctxDma=4, # FALCON_DMAIDX_PHYS_SYS_NCOH
+    self.dmem_desc = bytes(nv.RM_FLCN_BL_DMEM_DESC(ctxDma=4,
       codeDmaBaseLo=lo32(code_dma_base), codeDmaBaseHi=hi32(code_dma_base),
       nonSecureCodeOff=self.desc_v2.IMEMPhysBase, nonSecureCodeSize=self.desc_v2.IMEMLoadSize - self.desc_v2.IMEMSecSize,
       secureCodeOff=self.desc_v2.IMEMPhysBase + (self.desc_v2.IMEMSecBase - self.desc_v2.IMEMVirtBase), secureCodeSize=self.desc_v2.IMEMSecSize,

@@ -702,16 +702,6 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     self._setup_gpfifos()
 
-  # TEMP DEBUG (composed-coalescing-neumann plan, step 3): remove once the work submit token query passes cleanly.
-  def _diag_probe(self, tag:str, handle:int):
-    class _DiagParams(ctypes.Structure):
-      _fields_ = [("hChannel", ctypes.c_uint32), ("hClient", ctypes.c_uint32), ("bBound", ctypes.c_uint8), ("bEnabled", ctypes.c_uint8),
-                  ("bScheduled", ctypes.c_uint8), ("bCpuMap", ctypes.c_uint8), ("bContention", ctypes.c_uint8), ("bRunlistSet", ctypes.c_uint8),
-                  ("bDeferRC", ctypes.c_uint8)]
-    if not hasattr(self, "_diag_obj"): self._diag_obj = self.iface.rm_alloc(self.subdevice, 0x208f, None)
-    st = self.iface.rm_control(self._diag_obj, 0x208f0403, _DiagParams(hChannel=handle, hClient=self.iface.root))
-    print(f"DIAG[{tag}] handle={handle:#x}: bBound={st.bBound} bEnabled={st.bEnabled} bScheduled={st.bScheduled} bRunlistSet={st.bRunlistSet}")
-
   def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False, vaspace=0) -> GPFifo:
     notifier = self.iface.alloc(48 << 20, uncached=True)
 
@@ -749,7 +739,6 @@ class NVDevice(HCQCompiled[NVSignal]):
     else:
       token = self.iface.rm_control(gpfifo, nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
         nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1)).workSubmitToken
-      # Free cross-check on the driverless paths that already work: RM's own token must carry the chid we forced in its low 12 bits.
       if self.is_nvd() and (token & 0xfff) != chid: print(f"nv: WARNING token {token:#x} has chid {token & 0xfff}, we forced {chid}")
     if not video: self.iface.setup_gpfifo_vm(gpfifo)
 
