@@ -210,7 +210,6 @@ class MemoryManager:
     for paddr, psize in paddrs:
       for off, pt, pte_idx, pte_cnt, pte_covers in ctx.next(psize, paddr=paddr):
         for pte_off in range(pte_cnt):
-          # Only pass privileged when asked, so backends that have no such concept never see the kwarg.
           pt.set_entry(pte_idx + pte_off, paddr + off + pte_off * pte_covers, uncached=uncached, aspace=aspace, snooped=snooped,
                        frag=self._frag_size(ctx.vaddr+off, pte_cnt * pte_covers), valid=True, **({'privileged': True} if privileged else {}))
 
