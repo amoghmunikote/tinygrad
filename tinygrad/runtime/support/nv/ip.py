@@ -503,7 +503,8 @@ class NV_GSP(NV_IP):
     self.cmd_q = NVRpcQueue(self, self.cmd_q_view, None)
 
   def init_libos_args(self):
-    _, _, logbuf_addrs = self.nvdev._alloc_boot_mem(2 << 20)
+    # Keep the view around: when GSP dies it stops answering RPCs, so its own log buffers are the only place left to look.
+    self.logbuf_view, _, logbuf_addrs = self.nvdev._alloc_boot_mem(2 << 20)
     libos_args_view, _, libos_addrs = self.nvdev._alloc_boot_mem(0x1000)
     self.libos_args_sysmem = libos_addrs[0]
 
@@ -599,6 +600,11 @@ class NV_GSP(NV_IP):
     self.rpc_rm_alloc(hParent=0x0, hClass=0x0, params=nv_gpu.NV0000_ALLOC_PARAMETERS())
     dev = self.rpc_rm_alloc(hParent=self.priv_root, hClass=nv_gpu.NV01_DEVICE_0, params=nv_gpu.NV0080_ALLOC_PARAMETERS(hClientShare=self.priv_root))
     subdev = self.rpc_rm_alloc(hParent=dev, hClass=nv_gpu.NV20_SUBDEVICE_0, params=nv_gpu.NV2080_ALLOC_PARAMETERS())
+    # Every channel needs a fault method buffer, and its size is a property of the chip rather than something to guess -- query it once here,
+    # before the first channel is allocated, exactly like nouveau does at fifo oneinit.
+    self.mthdbuf_size = self.rpc_rm_control(hObject=subdev, cmd=nv_gpu.NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE,
+      params=nv_gpu.NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS()).size
+    if DEBUG >= 2: print(f"nv {self.nvdev.devfmt}: fault method buffer size {self.mthdbuf_size:#x}")
     vaspace = self.rpc_rm_alloc(hParent=dev, hClass=nv_gpu.FERMI_VASPACE_A, params=nv_gpu.NV_VASPACE_ALLOCATION_PARAMETERS())
 
     # reserve 512MB for the reserved PDES
@@ -733,8 +739,11 @@ class NV_GSP(NV_IP):
       params.ramfcMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=ramfc_alloc.paddrs[0][0], size=0x200, addressSpace=2, cacheAttrib=0)
       params.instanceMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=ramfc_alloc.paddrs[0][0], size=0x1000, addressSpace=2, cacheAttrib=0)
 
-      _, method_paddr, _ = self.nvdev._alloc_boot_mem(0x5000, sysmem=False)
-      params.mthdbufMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=method_paddr, size=0x5000, addressSpace=2, cacheAttrib=0)
+      # The fault method buffer belongs in sysmem, not vidmem, and its size comes from the chip (see init_golden_image). nouveau allocates it
+      # with dma_alloc_coherent and passes addressSpace=1; we had it in vidmem at a guessed 0x5000, which is the sort of thing that makes GSP's
+      # FECS interrupt handler fall over rather than fail cleanly.
+      _, _, method_sysaddrs = self.nvdev._alloc_boot_mem(self.mthdbuf_size, contiguous=True, sysmem=True)
+      params.mthdbufMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=method_sysaddrs[0], size=self.mthdbuf_size, addressSpace=1, cacheAttrib=0)
 
       if client is not None and client != self.priv_root and params.hObjectError != 0:
         params.errorNotifierMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=0, size=0xecc, addressSpace=0, cacheAttrib=0)
