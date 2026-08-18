@@ -467,12 +467,15 @@ class NV_GSP(NV_IP):
     self.rpc_set_registry_table()
 
     self.gpfifo_class, self.compute_class, self.dma_class = nv_gpu.AMPERE_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.AMPERE_DMA_COPY_B
+    self.threed_class = nv_gpu.AMPERE_B
     match self.nvdev.chip_name[:2]:
-      case "AD": self.compute_class = nv_gpu.ADA_COMPUTE_A
+      case "AD": self.compute_class, self.threed_class = nv_gpu.ADA_COMPUTE_A, nv_gpu.ADA_A
       case "GB":
         self.gpfifo_class,self.compute_class,self.dma_class=nv_gpu.BLACKWELL_CHANNEL_GPFIFO_A,nv_gpu.BLACKWELL_COMPUTE_B,nv_gpu.BLACKWELL_DMA_COPY_B
+        self.threed_class = nv_gpu.BLACKWELL_A
       case "TU":
         self.gpfifo_class,self.compute_class,self.dma_class=nv_gpu.TURING_CHANNEL_GPFIFO_A,nv_gpu.TURING_COMPUTE_A,nv_gpu.TURING_DMA_COPY_A
+        self.threed_class = nv_gpu.TURING_A
 
   def init_rm_args(self, queue_size=0x40000):
     # Alloc queues
@@ -628,6 +631,11 @@ class NV_GSP(NV_IP):
       11: GRBufDesc(cfgs_sizes[10], phys=True, virt=True)} # NOTE: 11 reuses cfgs_sizes[10]
     self._golden_ctxbufs = self.promote_ctx(self.priv_root, subdev, ch_gpfifo, {k:v for k, v in self.grctx_bufs.items() if not v.local})
 
+    # The 3D class is what actually triggers RM to build the golden context image. RM only maps the global GR context buffers when a 2D/3D object
+    # is allocated -- a channel carrying compute objects alone is precisely the case its own source calls out as leaving those buffers unmapped
+    # ("If VEID0 but only _TYPE_COMPUTE objects allocated, global GR ctx buffers mapping is skipped, MMU will fault!"), which is why nouveau
+    # allocates a 3D class here and nothing else. Allocate it first so the golden image exists before the compute/dma objects go on.
+    self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.threed_class, params=None)
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.compute_class, params=None)
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.dma_class, params=None)
     # nouveau frees its golden channel (and the whole throwaway client) once it has triggered RM's cached golden ctx init -- RM keeps the
@@ -654,20 +662,21 @@ class NV_GSP(NV_IP):
     # (KGRAPHICS_SCRUBBER_HANDLE_CHANNEL, r570/nvrm/gr.h) instead of an auto-generated one.
     ch_gpfifo = self.rpc_rm_alloc(hParent=dev, hClass=self.gpfifo_class, params=gg_params, handle=0xdada0045)
 
-    # {PM, PATCH}-only promotion (the pattern used for real per-user channels) left the channel without enough context for TURING_A
-    # (NV_ERR_INVALID_STATE). The full non-local set like golden's own promote_ctx isn't right either: passing fresh, un-backed virtual
-    # addresses for the six "global" buffers with bInitialize=False got NV_ERR_INVALID_ARGUMENT -- those need to actually reuse golden's
-    # already-established physical memory (its promote_ctx return value), not just repeat the same phys/virt flags with new addresses.
-    # PATCH (2) is genuinely fresh per-channel state, so promote it separately with its own real allocation.
-    self.promote_ctx(self.priv_root, subdev, ch_gpfifo, {k:v for k, v in self.grctx_bufs.items() if k == 2})
-    global_bufs = {k:v for k,v in self.grctx_bufs.items() if k in (3, 4, 5, 6, 9, 10, 11)}
-    self.promote_ctx(self.priv_root, subdev, ch_gpfifo, global_bufs,
-      bufs={k:v for k,v in self._golden_ctxbufs.items() if k in global_bufs}, phys=False)
-    # TURING_A itself still fails (now rejected at the RPC transport level, rpc_result=NV_ERR_INVALID_STATE, even with the fully-correct
-    # promote_ctx above and the right channel handle) -- skip it again and test whether the WAR accepts the channel without it now that
-    # promote_ctx is actually complete, since the params carry no reference to a 3D object at all.
-    self.rpc_rm_control(hObject=subdev, cmd=nv_gpu.NV2080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR,
-      params=nv_gpu.NV2080_CTRL_INTERNAL_KGR_INIT_BUG4208224_WAR_PARAMS(bTeardown=0))
+    # Same split rpc_rm_alloc uses for user compute channels: MAIN and PATCH fresh with bInitialize, globals mapped but reusing golden's memory.
+    chan_bufs = {k:self.grctx_bufs[k] for k in (0, 2) if k in self.grctx_bufs}
+    glob_bufs = {k:dataclasses.replace(self.grctx_bufs[k], phys=False, virt=True) for k in (3, 4, 5, 6, 9, 10) if k in self.grctx_bufs}
+    self.promote_ctx(self.priv_root, subdev, ch_gpfifo, {**chan_bufs, **glob_bufs},
+                     bufs={k:v for k,v in self._golden_ctxbufs.items() if k in glob_bufs})
+    self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.threed_class, params=None, handle=0xdada0046)
+
+    # The WAR control still comes back NV_ERR_INVALID_STATE. nouveau gives its scrubber a dedicated vmm/vaspace rather than sharing golden's,
+    # which is the most likely remaining difference, but the channel and its 3D object are what the WAR is really about -- keep going if only
+    # the control itself is rejected rather than failing device init over it.
+    try:
+      self.rpc_rm_control(hObject=subdev, cmd=nv_gpu.NV2080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR,
+        params=nv_gpu.NV2080_CTRL_INTERNAL_KGR_INIT_BUG4208224_WAR_PARAMS(bTeardown=0))
+    except RuntimeError as e:
+      if DEBUG >= 2: print(f"nv {self.nvdev.devfmt}: bug4208224 WAR control rejected ({e}), continuing with the scrubber channel in place")
 
   def init_hw(self):
     self.stat_q = NVRpcQueue(self, self.stat_q_view, self.cmd_q_view)
@@ -680,8 +689,10 @@ class NV_GSP(NV_IP):
 
     self.priv_root = 0xc1e00004
     self.init_golden_image()
-    # init_scrubber() (TU10x + 570.x bug-4208224 WAR) is a work in progress, not yet reliable on hardware -- see composed-coalescing-neumann
-    # plan step 4. Left defined but uncalled rather than deleted, since the handle/promote_ctx fixes found along the way are real progress.
+    # init_scrubber() (the TU10x + 570.x bug-4208224 WAR) is left defined but uncalled: with the corrected promote_ctx its channel and 3D object
+    # now allocate cleanly, but GSP still rejects the WAR control itself with NV_ERR_INVALID_STATE, and having the scrubber channel present
+    # changes nothing about the compute channel's GR context. nouveau gives its scrubber a dedicated vmm/vaspace instead of sharing golden's,
+    # which is the obvious next thing to try if this gets picked back up.
 
   def fini_hw(self): self.rpc_unloading_guest_driver()
 
@@ -707,15 +718,15 @@ class NV_GSP(NV_IP):
 
   def rpc_rm_alloc(self, hParent:int, hClass:int, params:Any, client=None, handle:int|None=None) -> int:
     if hClass == self.compute_class and (client or self.priv_root) != self.priv_root:
-      # nouveau (a real, working from-scratch GSP-RM client) promotes the ctx buffers before allocating the compute class object on the
-      # channel, not after -- PROMOTE_CTX targets the channel handle (hParent here), not the object being allocated, so nothing about it
-      # actually depends on the object existing yet. Promote phys+virt together in one call, same as init_golden_image does for the global
-      # buffers (the previous two-call split -- phys-only, then virt-only reusing the same buffers -- made RM return NV_ERR_OBJECT_NOT_FOUND
-      # on the second call, and that error was never checked). bufferId 0 (MAIN) is deliberately excluded: RM already tracks its own physical
-      # backing for it (kgrctxPrepareInitializeCtxBuffer_IMPL reads it from the channel group's own engine ctx descriptor, not from a
-      # client-chosen address), and promoting it with a client-supplied physical address here made GSP stop responding entirely rather than
-      # return an error. 1 (PM) and 2 (PATCH) are genuinely client-owned buffers.
-      self.promote_ctx(client or self.priv_root, self.subdevice, hParent, {k:v for k,v in self.grctx_bufs.items() if k in [1, 2]})
+      # Promote the GR context before allocating the compute object, like nouveau does -- PROMOTE_CTX targets the channel handle (hParent here),
+      # not the object being allocated, so it doesn't depend on the object existing yet. The split mirrors nouveau's r535_gr_promote_ctx with
+      # golden=false: MAIN and PATCH are per-channel state, so they get their own freshly allocated memory with bInitialize set, while the global
+      # buffers must be *mapped into this channel's context but reuse the physical memory the golden image already established* -- promoting them
+      # with fresh backing instead is what RM rejects. Buffer 11 (UNRESTRICTED_PRIV_ACCESS_MAP) is golden-only and deliberately left out.
+      chan_bufs = {k:self.grctx_bufs[k] for k in (0, 2) if k in self.grctx_bufs}
+      glob_bufs = {k:dataclasses.replace(self.grctx_bufs[k], phys=False, virt=True) for k in (3, 4, 5, 6, 9, 10) if k in self.grctx_bufs}
+      self.promote_ctx(client or self.priv_root, self.subdevice, hParent, {**chan_bufs, **glob_bufs},
+                       bufs={k:v for k,v in self._golden_ctxbufs.items() if k in glob_bufs})
 
     if hClass == self.gpfifo_class:
       ramfc_alloc = self.nvdev.mm.valloc(0x1000, contiguous=True)
