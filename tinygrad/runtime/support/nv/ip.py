@@ -378,7 +378,6 @@ class NV_FLCN(NV_IP):
     time.sleep(0.1)
     engine_reg.write(reset=0)
 
-    # HWCFG2.MEM_SCRUBBING doesn't exist on Turing, it reports imem/dmem scrubbing through DMACTL instead.
     scrub_reg, scrub_fields = ((self.nvdev.NV_PFALCON_FALCON_DMACTL, ('dmem_scrubbing', 'imem_scrubbing')) if self.nvdev.fw_name == "tu102"
                                else (self.nvdev.NV_PFALCON_FALCON_HWCFG2, ('mem_scrubbing',)))
     wait_cond(lambda: any(scrub_reg.with_base(base).read_bitfields()[f] for f in scrub_fields), value=False, msg="Scrubbing not completed")
@@ -503,12 +502,10 @@ class NV_GSP(NV_IP):
     self.cmd_q = NVRpcQueue(self, self.cmd_q_view, None)
 
   def init_libos_args(self):
-    # Keep the view around: when GSP dies it stops answering RPCs, so its own log buffers are the only place left to look.
     self.logbuf_view, _, logbuf_addrs = self.nvdev._alloc_boot_mem(2 << 20)
     libos_args_view, _, libos_addrs = self.nvdev._alloc_boot_mem(0x1000)
     self.libos_args_sysmem = libos_addrs[0]
 
-    # Turing/GA100 run libos2, which only has the init and rm logs. libos3 (Ampere+) adds the rest, incl. the kernel log.
     logs = ["INIT", "RM"] if self.nvdev.fw_name == "tu102" else ["INIT", "INTR", "RM", "MNOC", "KRNL"]
     libos_structs = [nv.LibosMemoryRegionInitArgument(kind=nv.LIBOS_MEMORY_REGION_CONTIGUOUS, loc=nv.LIBOS_MEMORY_REGION_LOC_SYSMEM, size=0x10000,
         id8=int.from_bytes(bytes(f"LOG{name}", 'utf-8'), 'big'), pa=logbuf_addrs[0] + 0x10000 * i) for i, name in enumerate(logs)]
@@ -555,8 +552,6 @@ class NV_GSP(NV_IP):
     self.booter_bar1 = booter_addrs[0]
 
   def wpr_heap_size(self) -> int:
-    # RM sizes the wpr heap as os_carveout + base + per-gb-of-fb + client alloc reserve, clamped. libos2 (Turing/GA100) has no os carveout and a
-    # lower clamp than libos3 (Ampere+). 0x8100000 is what this works out to for a 24gb libos3 part, which is what the other chips were tuned on.
     if self.nvdev.fw_name != "tu102": return 0x8100000
     heap_sz = (8 << 20) + round_up(0x18000 * ceildiv(self.nvdev.vram_size, 1 << 30), 1 << 20) + round_up(0xc000 * 2048, 1 << 20)
     return min(max(heap_sz, 64 << 20), 256 << 20)
@@ -600,8 +595,6 @@ class NV_GSP(NV_IP):
     self.rpc_rm_alloc(hParent=0x0, hClass=0x0, params=nv_gpu.NV0000_ALLOC_PARAMETERS())
     dev = self.rpc_rm_alloc(hParent=self.priv_root, hClass=nv_gpu.NV01_DEVICE_0, params=nv_gpu.NV0080_ALLOC_PARAMETERS(hClientShare=self.priv_root))
     subdev = self.rpc_rm_alloc(hParent=dev, hClass=nv_gpu.NV20_SUBDEVICE_0, params=nv_gpu.NV2080_ALLOC_PARAMETERS())
-    # Every channel needs a fault method buffer, and its size is a property of the chip rather than something to guess -- query it once here,
-    # before the first channel is allocated, exactly like nouveau does at fifo oneinit.
     self.mthdbuf_size = self.rpc_rm_control(hObject=subdev, cmd=nv_gpu.NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE,
       params=nv_gpu.NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS()).size
     if DEBUG >= 2: print(f"nv {self.nvdev.devfmt}: fault method buffer size {self.mthdbuf_size:#x}")
@@ -637,25 +630,13 @@ class NV_GSP(NV_IP):
       11: GRBufDesc(cfgs_sizes[10], phys=True, virt=True)} # NOTE: 11 reuses cfgs_sizes[10]
     self._golden_ctxbufs = self.promote_ctx(self.priv_root, subdev, ch_gpfifo, {k:v for k, v in self.grctx_bufs.items() if not v.local})
 
-    # The 3D class is what actually triggers RM to build the golden context image. RM only maps the global GR context buffers when a 2D/3D object
-    # is allocated -- a channel carrying compute objects alone is precisely the case its own source calls out as leaving those buffers unmapped
-    # ("If VEID0 but only _TYPE_COMPUTE objects allocated, global GR ctx buffers mapping is skipped, MMU will fault!"), which is why nouveau
-    # allocates a 3D class here and nothing else. Allocate it first so the golden image exists before the compute/dma objects go on.
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.threed_class, params=None)
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.compute_class, params=None)
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.dma_class, params=None)
-    # nouveau frees its golden channel (and the whole throwaway client) once it has triggered RM's cached golden ctx init -- RM keeps the
-    # cached context independent of the channel that triggered it. We were never freeing this, which left a permanent "admin priv" GR0
-    # channel around; a second one for the scrubber below reliably hit NV_ERR_NO_MEMORY on hardware until this got freed first.
     self.rpc_free(ch_gpfifo)
     self._golden_dev, self._golden_subdev, self._golden_vaspace = dev, subdev, vaspace
 
   def init_scrubber(self):
-    # TU10x + 570.x firmware WAR (bug 4208224): a permanently-held GR "scrubber" channel must exist before any user GR channel will
-    # actually get its runlist committed. Confirmed against nouveau's real GSP-RM client (r570_gr_scrubber_init, gated on this exact
-    # chipset range) -- the WAR control below doesn't exist on r535 firmware at all, and calling it bare (no channel) correctly comes
-    # back NV_ERR_INVALID_CHANNEL, confirming it really does require one. Reuses golden's now-freed-channel client/device/subdevice/
-    # vaspace -- only the channel itself is new (with its own cid so it can't collide with golden's, even freed).
     if self.nvdev.chip_name not in ("TU102", "TU104", "TU106"): return
     dev, subdev, vaspace = self._golden_dev, self._golden_subdev, self._golden_vaspace
 
@@ -663,21 +644,14 @@ class NV_GSP(NV_IP):
     userd = nv_gpu.NV_MEMORY_DESC_PARAMS(base=gpfifo_area.paddrs[0][0] + 0x20 * 8, size=0x20, addressSpace=2, cacheAttrib=0)
     gg_params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(gpFifoOffset=gpfifo_area.va_addr, gpFifoEntries=32, engineType=0x1, cid=4,
       hVASpace=vaspace, userdOffset=(ctypes.c_uint64*8)(0x20 * 8), userdMem=userd, internalFlags=0x1a, flags=0x200320)
-    # NV_ERR_INVALID_CHANNEL from the WAR control (even with a valid, promoted channel) strongly suggests GSP-RM's internal implementation
-    # looks up the scrubber channel by a specific expected handle, not just "any GR0 channel that exists" -- use nouveau's exact constant
-    # (KGRAPHICS_SCRUBBER_HANDLE_CHANNEL, r570/nvrm/gr.h) instead of an auto-generated one.
     ch_gpfifo = self.rpc_rm_alloc(hParent=dev, hClass=self.gpfifo_class, params=gg_params, handle=0xdada0045)
 
-    # Same split rpc_rm_alloc uses for user compute channels: MAIN and PATCH fresh with bInitialize, globals mapped but reusing golden's memory.
     chan_bufs = {k:self.grctx_bufs[k] for k in (0, 2) if k in self.grctx_bufs}
     glob_bufs = {k:dataclasses.replace(self.grctx_bufs[k], phys=False, virt=True) for k in (3, 4, 5, 6, 9, 10) if k in self.grctx_bufs}
     self.promote_ctx(self.priv_root, subdev, ch_gpfifo, {**chan_bufs, **glob_bufs},
                      bufs={k:v for k,v in self._golden_ctxbufs.items() if k in glob_bufs})
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.threed_class, params=None, handle=0xdada0046)
 
-    # The WAR control still comes back NV_ERR_INVALID_STATE. nouveau gives its scrubber a dedicated vmm/vaspace rather than sharing golden's,
-    # which is the most likely remaining difference, but the channel and its 3D object are what the WAR is really about -- keep going if only
-    # the control itself is rejected rather than failing device init over it.
     try:
       self.rpc_rm_control(hObject=subdev, cmd=nv_gpu.NV2080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR,
         params=nv_gpu.NV2080_CTRL_INTERNAL_KGR_INIT_BUG4208224_WAR_PARAMS(bTeardown=0))
@@ -695,16 +669,6 @@ class NV_GSP(NV_IP):
 
     self.priv_root = 0xc1e00004
     self.init_golden_image()
-
-    # Turing GSP-RM has no handler for FECS's CTXSW_INTR0 -- the ISR ends in NV_ASSERT_FAILED (RISC-V ebreak) inside gr_error_gk110.c. The
-    # kernel driver survives because its own host-side ISR ACKs the interrupt before GSP ever sees it. We do the same from userspace, inline
-    # in ops_nv._submit_to_gpfifo after every doorbell -- see the comment there for why this has to be in the submit thread rather than a
-    # daemon (Python GIL starves a background thread inside CPU-bound sequences like _setup_gpfifos).
-
-    # init_scrubber() (the TU10x + 570.x bug-4208224 WAR) is left defined but uncalled: with the corrected promote_ctx its channel and 3D object
-    # now allocate cleanly, but GSP still rejects the WAR control itself with NV_ERR_INVALID_STATE, and having the scrubber channel present
-    # changes nothing about the compute channel's GR context. nouveau gives its scrubber a dedicated vmm/vaspace instead of sharing golden's,
-    # which is the obvious next thing to try if this gets picked back up.
 
   def fini_hw(self): self.rpc_unloading_guest_driver()
 
@@ -730,11 +694,6 @@ class NV_GSP(NV_IP):
 
   def rpc_rm_alloc(self, hParent:int, hClass:int, params:Any, client=None, handle:int|None=None) -> int:
     if hClass == self.compute_class and (client or self.priv_root) != self.priv_root:
-      # Promote the GR context before allocating the compute object, like nouveau does -- PROMOTE_CTX targets the channel handle (hParent here),
-      # not the object being allocated, so it doesn't depend on the object existing yet. The split mirrors nouveau's r535_gr_promote_ctx with
-      # golden=false: MAIN and PATCH are per-channel state, so they get their own freshly allocated memory with bInitialize set, while the global
-      # buffers must be *mapped into this channel's context but reuse the physical memory the golden image already established* -- promoting them
-      # with fresh backing instead is what RM rejects. Buffer 11 (UNRESTRICTED_PRIV_ACCESS_MAP) is golden-only and deliberately left out.
       chan_bufs = {k:self.grctx_bufs[k] for k in (0, 2) if k in self.grctx_bufs}
       glob_bufs = {k:dataclasses.replace(self.grctx_bufs[k], phys=False, virt=True) for k in (3, 4, 5, 6, 9, 10) if k in self.grctx_bufs}
       self.promote_ctx(client or self.priv_root, self.subdevice, hParent, {**chan_bufs, **glob_bufs},
@@ -745,19 +704,11 @@ class NV_GSP(NV_IP):
       params.ramfcMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=ramfc_alloc.paddrs[0][0], size=0x200, addressSpace=2, cacheAttrib=0)
       params.instanceMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=ramfc_alloc.paddrs[0][0], size=0x1000, addressSpace=2, cacheAttrib=0)
 
-      # The fault method buffer belongs in sysmem, not vidmem, and its size comes from the chip (see init_golden_image). nouveau allocates it
-      # with dma_alloc_coherent and passes addressSpace=1; we had it in vidmem at a guessed 0x5000, which is the sort of thing that makes GSP's
-      # FECS interrupt handler fall over rather than fail cleanly.
       _, _, method_sysaddrs = self.nvdev._alloc_boot_mem(self.mthdbuf_size, contiguous=True, sysmem=True)
       params.mthdbufMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=method_sysaddrs[0], size=self.mthdbuf_size, addressSpace=1, cacheAttrib=0)
 
       if client is not None and client != self.priv_root:
         params.userdMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=params.hUserdMemory[0] + params.userdOffset[0], size=0x200, addressSpace=2, cacheAttrib=0)
-
-        # Declare the channel's error notifier the way nouveau does: PRIVILEGE=USER, and both notifier types explicitly NONE with a null handle.
-        # Leaving internalFlags at 0 means ERROR_NOTIFIER_TYPE_UNKNOWN, which the SDK reserves for kernel CPU-RM clients, and we were pairing it
-        # with an errorNotifierMem descriptor that was all zeroes -- a null memory descriptor GSP is entitled to walk straight into.
-        # NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS: PRIVILEGE 1:0 = USER(0), ERROR_NOTIFIER_TYPE 3:2 = NONE(1), ECC_ERROR_NOTIFIER_TYPE 5:4 = NONE(1).
         params.hObjectError, params.errorNotifierMem = 0, nv_gpu.NV_MEMORY_DESC_PARAMS()
         params.internalFlags = (0 << 0) | (1 << 2) | (1 << 4)
 

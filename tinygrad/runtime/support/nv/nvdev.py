@@ -41,8 +41,6 @@ class NVPageTableEntry:
   def set_entry(self, entry_id:int, paddr:int, table=False, uncached=False, aspace=AddrSpace.PHYS, snooped=False, frag=0, valid=True,
                 privileged=False):
     if not table:
-      # GR context buffers have to be mapped privileged -- nouveau sets gf100_vmm_map_v0.priv on every one of them. Only ver2 (pre-Hopper) has a
-      # dedicated privilege bit; ver3 folds the same thing into pcf, so leave that path alone.
       x = self.nvdev.pte_t.encode(valid=valid, address_sys=paddr >> 12, aperture=2 if aspace is AddrSpace.SYS else 0, kind=6,
         **({'pcf': int(uncached)} if self.nvdev.mmu_ver == 3 else {'vol': uncached, 'privilege': int(privileged)}))
     else:
@@ -112,8 +110,7 @@ class NVDev:
     self.chip_name = CHIP_ARCH_NAMES[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
     self.fw_name = CHIP_FW_NAMES[self.chip_name[:3]]
 
-    # Ampere+ gets its fb size from a scratch register that GFW repopulates after a reset. Turing has no GFW and reads the devinit-programmed fb
-    # config instead, which the reset below clears, so sample it while it is still there.
+
     if self.fw_name == "tu102":
       self.include("dev_fb", "gp102")
       f = self.reg("NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE").read_bitfields()
@@ -132,8 +129,6 @@ class NVDev:
     self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
 
-    # Turing has no GFW, so the AON scratch regs here are never read on it (see NV_FLCN.wait_for_reset and _early_mmu_init), but the BSI scratch is:
-    # the gsp cpu sequencer's core resume op needs NV_PGC6_BSI_SECURE_SCRATCH_14, which is at the same address with the same field on tu102.
     self.include("dev_gc6_island", "ga102")
 
     self.flcn:NV_FLCN|NV_FLCN_COT = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
@@ -171,7 +166,6 @@ class NVDev:
   def _alloc_boot_mem(self, size:int, data:bytes|None=None, contiguous:bool=False, sysmem:bool|None=None) -> tuple[MMIOInterface,int|None,list[int]]:
     sz = round_up(size, 0x1000)
     if sysmem is True or (sysmem is None and not self.large_bar):
-      # Pass the page-aligned size: system_paddrs() walks whole pages, so a sub-page size resolves to no addresses at all.
       view, sysaddr = self.pci_dev.alloc_sysmem(sz, 0, contiguous=contiguous)
       paddr = None
     else:
