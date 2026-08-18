@@ -7,6 +7,8 @@ from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.elf import elf_loader
 
+def rm_err(status:int) -> str: return f"{status}: {nv_gpu.nv_status_codes.get(status, 'Unknown error')}"
+
 @dataclasses.dataclass(frozen=True)
 class GRBufDesc: size:int; virt:bool; phys:bool; local:bool=False # noqa: E702
 
@@ -455,6 +457,7 @@ class NV_FLCN_COT(NV_IP):
 class NV_GSP(NV_IP):
   def init_sw(self):
     self.handle_gen = itertools.count(0xcf000000)
+    self.subdevice:int = 0
     self.init_rm_args()
     self.init_libos_args()
     self.init_wpr_meta()
@@ -623,10 +626,48 @@ class NV_GSP(NV_IP):
       2: GRBufDesc(patch_size, phys=True, virt=True), **{x: GRBufDesc(cfgs_sizes[x], phys=False, virt=True) for x in range(3, 7)},
       9: GRBufDesc(cfgs_sizes[9], phys=True, virt=True), 10: GRBufDesc(cfgs_sizes[10], phys=True, virt=False),
       11: GRBufDesc(cfgs_sizes[10], phys=True, virt=True)} # NOTE: 11 reuses cfgs_sizes[10]
-    self.promote_ctx(self.priv_root, subdev, ch_gpfifo, {k:v for k, v in self.grctx_bufs.items() if not v.local})
+    self._golden_ctxbufs = self.promote_ctx(self.priv_root, subdev, ch_gpfifo, {k:v for k, v in self.grctx_bufs.items() if not v.local})
 
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.compute_class, params=None)
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.dma_class, params=None)
+    # nouveau frees its golden channel (and the whole throwaway client) once it has triggered RM's cached golden ctx init -- RM keeps the
+    # cached context independent of the channel that triggered it. We were never freeing this, which left a permanent "admin priv" GR0
+    # channel around; a second one for the scrubber below reliably hit NV_ERR_NO_MEMORY on hardware until this got freed first.
+    self.rpc_free(ch_gpfifo)
+    self._golden_dev, self._golden_subdev, self._golden_vaspace = dev, subdev, vaspace
+
+  def init_scrubber(self):
+    # TU10x + 570.x firmware WAR (bug 4208224): a permanently-held GR "scrubber" channel must exist before any user GR channel will
+    # actually get its runlist committed. Confirmed against nouveau's real GSP-RM client (r570_gr_scrubber_init, gated on this exact
+    # chipset range) -- the WAR control below doesn't exist on r535 firmware at all, and calling it bare (no channel) correctly comes
+    # back NV_ERR_INVALID_CHANNEL, confirming it really does require one. Reuses golden's now-freed-channel client/device/subdevice/
+    # vaspace -- only the channel itself is new (with its own cid so it can't collide with golden's, even freed).
+    if self.nvdev.chip_name not in ("TU102", "TU104", "TU106"): return
+    dev, subdev, vaspace = self._golden_dev, self._golden_subdev, self._golden_vaspace
+
+    gpfifo_area = self.nvdev.mm.valloc(4 << 10, contiguous=True)
+    userd = nv_gpu.NV_MEMORY_DESC_PARAMS(base=gpfifo_area.paddrs[0][0] + 0x20 * 8, size=0x20, addressSpace=2, cacheAttrib=0)
+    gg_params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(gpFifoOffset=gpfifo_area.va_addr, gpFifoEntries=32, engineType=0x1, cid=4,
+      hVASpace=vaspace, userdOffset=(ctypes.c_uint64*8)(0x20 * 8), userdMem=userd, internalFlags=0x1a, flags=0x200320)
+    # NV_ERR_INVALID_CHANNEL from the WAR control (even with a valid, promoted channel) strongly suggests GSP-RM's internal implementation
+    # looks up the scrubber channel by a specific expected handle, not just "any GR0 channel that exists" -- use nouveau's exact constant
+    # (KGRAPHICS_SCRUBBER_HANDLE_CHANNEL, r570/nvrm/gr.h) instead of an auto-generated one.
+    ch_gpfifo = self.rpc_rm_alloc(hParent=dev, hClass=self.gpfifo_class, params=gg_params, handle=0xdada0045)
+
+    # {PM, PATCH}-only promotion (the pattern used for real per-user channels) left the channel without enough context for TURING_A
+    # (NV_ERR_INVALID_STATE). The full non-local set like golden's own promote_ctx isn't right either: passing fresh, un-backed virtual
+    # addresses for the six "global" buffers with bInitialize=False got NV_ERR_INVALID_ARGUMENT -- those need to actually reuse golden's
+    # already-established physical memory (its promote_ctx return value), not just repeat the same phys/virt flags with new addresses.
+    # PATCH (2) is genuinely fresh per-channel state, so promote it separately with its own real allocation.
+    self.promote_ctx(self.priv_root, subdev, ch_gpfifo, {k:v for k, v in self.grctx_bufs.items() if k == 2})
+    global_bufs = {k:v for k,v in self.grctx_bufs.items() if k in (3, 4, 5, 6, 9, 10, 11)}
+    self.promote_ctx(self.priv_root, subdev, ch_gpfifo, global_bufs,
+      bufs={k:v for k,v in self._golden_ctxbufs.items() if k in global_bufs}, phys=False)
+    # TURING_A itself still fails (now rejected at the RPC transport level, rpc_result=NV_ERR_INVALID_STATE, even with the fully-correct
+    # promote_ctx above and the right channel handle) -- skip it again and test whether the WAR accepts the channel without it now that
+    # promote_ctx is actually complete, since the params carry no reference to a 3D object at all.
+    self.rpc_rm_control(hObject=subdev, cmd=nv_gpu.NV2080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR,
+      params=nv_gpu.NV2080_CTRL_INTERNAL_KGR_INIT_BUG4208224_WAR_PARAMS(bTeardown=0))
 
   def init_hw(self):
     self.stat_q = NVRpcQueue(self, self.stat_q_view, self.cmd_q_view)
@@ -639,10 +680,18 @@ class NV_GSP(NV_IP):
 
     self.priv_root = 0xc1e00004
     self.init_golden_image()
+    # init_scrubber() (TU10x + 570.x bug-4208224 WAR) is a work in progress, not yet reliable on hardware -- see composed-coalescing-neumann
+    # plan step 4. Left defined but uncalled rather than deleted, since the handle/promote_ctx fixes found along the way are real progress.
 
   def fini_hw(self): self.rpc_unloading_guest_driver()
 
   ### RPCs
+
+  def rpc_free(self, hObject:int, client=None) -> None:
+    free_args = nv.rpc_free_v(params=nv.NVOS00_PARAMETERS_v03_00(hRoot=(client:=client or self.priv_root), hObjectParent=0,
+      hObjectOld=hObject, status=0))
+    self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_FREE, bytes(free_args))
+    self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_FREE)
 
   def rpc_alloc_memory(self, hDevice:int, hClass:int, paddrs:list[tuple[int,int]], length:int, flags:int, client:int|None=None) -> int:
     assert all(sz == 0x1000 for _, sz in paddrs), f"all pages must be 4KB, got {[(hex(p), hex(sz)) for p, sz in paddrs]}"
@@ -656,7 +705,18 @@ class NV_GSP(NV_IP):
     self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_ALLOC_MEMORY)
     return handle
 
-  def rpc_rm_alloc(self, hParent:int, hClass:int, params:Any, client=None) -> int:
+  def rpc_rm_alloc(self, hParent:int, hClass:int, params:Any, client=None, handle:int|None=None) -> int:
+    if hClass == self.compute_class and (client or self.priv_root) != self.priv_root:
+      # nouveau (a real, working from-scratch GSP-RM client) promotes the ctx buffers before allocating the compute class object on the
+      # channel, not after -- PROMOTE_CTX targets the channel handle (hParent here), not the object being allocated, so nothing about it
+      # actually depends on the object existing yet. Promote phys+virt together in one call, same as init_golden_image does for the global
+      # buffers (the previous two-call split -- phys-only, then virt-only reusing the same buffers -- made RM return NV_ERR_OBJECT_NOT_FOUND
+      # on the second call, and that error was never checked). bufferId 0 (MAIN) is deliberately excluded: RM already tracks its own physical
+      # backing for it (kgrctxPrepareInitializeCtxBuffer_IMPL reads it from the channel group's own engine ctx descriptor, not from a
+      # client-chosen address), and promoting it with a client-supplied physical address here made GSP stop responding entirely rather than
+      # return an error. 1 (PM) and 2 (PATCH) are genuinely client-owned buffers.
+      self.promote_ctx(client or self.priv_root, self.subdevice, hParent, {k:v for k,v in self.grctx_bufs.items() if k in [1, 2]})
+
     if hClass == self.gpfifo_class:
       ramfc_alloc = self.nvdev.mm.valloc(0x1000, contiguous=True)
       params.ramfcMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=ramfc_alloc.paddrs[0][0], size=0x200, addressSpace=2, cacheAttrib=0)
@@ -669,18 +729,16 @@ class NV_GSP(NV_IP):
         params.errorNotifierMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=0, size=0xecc, addressSpace=0, cacheAttrib=0)
         params.userdMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=params.hUserdMemory[0] + params.userdOffset[0], size=0x400, addressSpace=2, cacheAttrib=0)
 
-    alloc_args = nv.rpc_gsp_rm_alloc_v(hClient=(client:=client or self.priv_root), hParent=hParent, hObject=(obj:=next(self.handle_gen)),
+    alloc_args = nv.rpc_gsp_rm_alloc_v(hClient=(client:=client or self.priv_root), hParent=hParent, hObject=(obj:=handle or next(self.handle_gen)),
       hClass=hClass, flags=0x0, paramsSize=ctypes.sizeof(params) if params is not None else 0x0)
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC, bytes(alloc_args) + (bytes(params) if params is not None else b''))
-    self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC)
+    res = self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC)
+    if (st:=nv.rpc_gsp_rm_alloc_v.from_buffer_copy(res).status) != 0: raise RuntimeError(f"rm_alloc of {hClass:#x} returned {rm_err(st)}")
 
     if hClass == nv_gpu.FERMI_VASPACE_A and client != self.priv_root:
       self.rpc_set_page_directory(device=hParent, hVASpace=obj, pdir_paddr=self.nvdev.mm.root_page_table.paddr, client=client)
     if hClass == nv_gpu.NV01_DEVICE_0 and client != self.priv_root: self.device = obj # save user device handle
     if hClass == nv_gpu.NV20_SUBDEVICE_0: self.subdevice = obj # save subdevice handle
-    if hClass == self.compute_class and client != self.priv_root:
-      phys_gr_ctx = self.promote_ctx(client, self.subdevice, hParent, {k:v for k,v in self.grctx_bufs.items() if k in [0, 1, 2]}, virt=False)
-      self.promote_ctx(client, self.subdevice, hParent, {k:v for k,v in self.grctx_bufs.items() if k in [0, 1, 2]}, phys_gr_ctx, phys=False)
     return obj if hClass != nv_gpu.NV1_ROOT else client
 
   def rpc_rm_control(self, hObject:int, cmd:int, params:Any, client=None, extra=None):
@@ -698,6 +756,8 @@ class NV_GSP(NV_IP):
       paramsSize=ctypes.sizeof(params) if params is not None else 0x0)
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL, bytes(control_args) + (bytes(params) if params is not None else b''))
     res = self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL)
+    if (status:=nv.rpc_gsp_rm_control_v.from_buffer_copy(res).status) != 0:
+      raise RuntimeError(f"rm_control {cmd:#x} on {hObject:#x} returned {rm_err(status)}")
     st = type(params).from_buffer_copy(res[len(bytes(control_args)):]) if params is not None else None
 
     # NOTE: gb20x requires the enable bit for token submission. Patch workSubmitToken here to maintain userspace compatibility.

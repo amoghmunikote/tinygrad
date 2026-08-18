@@ -405,6 +405,7 @@ class GPFifo:
   gpput: MMIOInterface
   entries_count: int
   token: int
+  handle: int = 0
   put_value: int = 0
 
 class NVKIface:
@@ -655,18 +656,27 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     self.iface.setup_vm(vaspace)
 
-    channel_params = nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS)
-    self.channel_group = self.iface.rm_alloc(self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A, channel_params)
-
     self.gpfifo_area = self.iface.alloc(0x300000, contiguous=True, cpu_access=True, force_devmem=True,
       map_flags=(nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23))
 
-    ctxshare_params = nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC)
-    ctxshare = self.iface.rm_alloc(self.channel_group, nv_gpu.FERMI_CONTEXT_SHARE_A, ctxshare_params)
+    # On the driverless GSP path, match nouveau's real GSP-RM client: no explicit TSG. On Turing, engineType passed at TSG/channel
+    # *alloc* time is silently discarded by Kernel RM (kfifoIsPerRunlistChramSupportedInHw is false pre-Ampere, so the blocks that would
+    # store it into pKernelChannelGroup->engineType/pKernelChannel->engineType never run), and an explicit client-allocated TSG makes
+    # kfifoRunlistSetId_GM107's bAllocatedByRm check behave differently than the implicit, RM-owned group a bare channel gets wrapped in
+    # -- which is exactly the group nouveau always uses. Channels go straight under the device, hContextShare=0, hVASpace set directly.
+    if self.is_nvd(): self.channel_group, ctxshare = self.nvdevice, 0
+    else:
+      channel_params = nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS)
+      self.channel_group = self.iface.rm_alloc(self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A, channel_params)
+      ctxshare_params = nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC)
+      ctxshare = self.iface.rm_alloc(self.channel_group, nv_gpu.FERMI_CONTEXT_SHARE_A, ctxshare_params)
 
-    self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)
-    self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0x100000, entries=0x10000, compute=False)
-    self.iface.rm_control(self.channel_group, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
+    self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True,
+      vaspace=vaspace)
+    self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0x100000, entries=0x10000, compute=False,
+      vaspace=vaspace)
+    if not self.is_nvd():
+      self.iface.rm_control(self.channel_group, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
 
     self.cmdq_page:HCQBuffer = self.iface.alloc(0x200000, cpu_access=True)
     self.cmdq_allocator = BumpAllocator(size=self.cmdq_page.size, base=int(self.cmdq_page.va_addr), wrap=True)
@@ -687,14 +697,33 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     self._setup_gpfifos()
 
-  def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False) -> GPFifo:
+  # TEMP DEBUG (composed-coalescing-neumann plan, step 3): remove once the work submit token query passes cleanly.
+  def _diag_probe(self, tag:str, handle:int):
+    class _DiagParams(ctypes.Structure):
+      _fields_ = [("hChannel", ctypes.c_uint32), ("hClient", ctypes.c_uint32), ("bBound", ctypes.c_uint8), ("bEnabled", ctypes.c_uint8),
+                  ("bScheduled", ctypes.c_uint8), ("bCpuMap", ctypes.c_uint8), ("bContention", ctypes.c_uint8), ("bRunlistSet", ctypes.c_uint8),
+                  ("bDeferRC", ctypes.c_uint8)]
+    if not hasattr(self, "_diag_obj"): self._diag_obj = self.iface.rm_alloc(self.subdevice, 0x208f, None)
+    st = self.iface.rm_control(self._diag_obj, 0x208f0403, _DiagParams(hChannel=handle, hClient=self.iface.root))
+    print(f"DIAG[{tag}] handle={handle:#x}: bBound={st.bBound} bEnabled={st.bEnabled} bScheduled={st.bScheduled} bRunlistSet={st.bRunlistSet}")
+
+  def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False, vaspace=0) -> GPFifo:
     notifier = self.iface.alloc(48 << 20, uncached=True)
     # NVDEC channels must not use the UVM-owned (externally owned) vaspace: RM skips mapping the engine ctx buffer for it and UVM never maps it
     # for video engines, so the channel would run with an invalid ctx. Use the RM-managed vaspace, which _gpu_uvm_map also maps every buffer into.
     params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(gpFifoOffset=gpfifo_area.va_addr+offset, gpFifoEntries=entries, hContextShare=ctxshare,
-      hObjectError=notifier.meta.hMemory, hObjectBuffer=self.virtmem if video else gpfifo_area.meta.hMemory,
+      hVASpace=vaspace if ctxshare == 0 else 0, hObjectError=notifier.meta.hMemory, hObjectBuffer=self.virtmem if video else gpfifo_area.meta.hMemory,
       hUserdMemory=(ctypes.c_uint32*8)(gpfifo_area.meta.hMemory), userdOffset=(ctypes.c_uint64*8)(entries*8+offset), engineType=19 if video else 0)
     gpfifo = self.iface.rm_alloc(channel_group, self.iface.gpfifo_class, params)
+
+    # Pre-Ampere the runlist isn't committed when the channel is constructed (kernel RM does this for us on that path; GSP doesn't), and both the
+    # engine-context promotion triggered by the compute/dma object allocs below and the work submit token query further down need it committed
+    # first, so bind right after the channel exists and before anything else touches it. BIND needs the channel's real engine type -- NULL (0)
+    # silently no-ops the runlist assignment for SW/BUS engines and, worse, was defaulting the DMA channel onto the graphics engine's runlist.
+    bind_engine_type = params.engineType if video else (nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS if compute else nv_gpu.NV2080_ENGINE_TYPE_COPY0)
+    if channel_group == self.nvdevice:
+      self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_BIND, nv_gpu.NVA06F_CTRL_BIND_PARAMS(engineType=bind_engine_type))
+      if self.is_nvd(): self._diag_probe("after-bind", gpfifo)
 
     if compute:
       self.debug_compute_obj, self.debug_channel = self.iface.rm_alloc(gpfifo, self.iface.compute_class), gpfifo
@@ -704,14 +733,14 @@ class NVDevice(HCQCompiled[NVSignal]):
     else: self.iface.rm_alloc(gpfifo, self.iface.viddec_class, nv_gpu.NV_BSP_ALLOCATION_PARAMETERS(size=nv_gpu.NV_BSP_ALLOCATION_PARAMETERS.SIZE))
 
     if channel_group == self.nvdevice:
-      self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_BIND, nv_gpu.NVA06F_CTRL_BIND_PARAMS(engineType=params.engineType))
       self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
+      if self.is_nvd(): self._diag_probe("after-schedule", gpfifo)
 
-    ws_token_params = self.iface.rm_control(gpfifo, nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
-      nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1))
-    if ctxshare != 0: self.iface.setup_gpfifo_vm(gpfifo)
+    token = self.iface.rm_control(gpfifo, nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
+      nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1)).workSubmitToken
+    if not video: self.iface.setup_gpfifo_vm(gpfifo)
 
-    return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=ws_token_params.workSubmitToken,
+    return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=token, handle=gpfifo,
                   gpput=gpfifo_area.cpu_view().view(offset + entries*8 + getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, fmt='I'))
 
   def _query_gpu_info(self, *reqs):
