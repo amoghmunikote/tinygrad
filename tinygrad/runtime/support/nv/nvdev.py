@@ -38,10 +38,13 @@ class NVPageTableEntry:
 
   def _is_dual_pde(self) -> bool: return self.lv == self.nvdev.mm.level_cnt - 2
 
-  def set_entry(self, entry_id:int, paddr:int, table=False, uncached=False, aspace=AddrSpace.PHYS, snooped=False, frag=0, valid=True):
+  def set_entry(self, entry_id:int, paddr:int, table=False, uncached=False, aspace=AddrSpace.PHYS, snooped=False, frag=0, valid=True,
+                privileged=False):
     if not table:
+      # GR context buffers have to be mapped privileged -- nouveau sets gf100_vmm_map_v0.priv on every one of them. Only ver2 (pre-Hopper) has a
+      # dedicated privilege bit; ver3 folds the same thing into pcf, so leave that path alone.
       x = self.nvdev.pte_t.encode(valid=valid, address_sys=paddr >> 12, aperture=2 if aspace is AddrSpace.SYS else 0, kind=6,
-        **({'pcf': int(uncached)} if self.nvdev.mmu_ver == 3 else {'vol': uncached}))
+        **({'pcf': int(uncached)} if self.nvdev.mmu_ver == 3 else {'vol': uncached, 'privilege': int(privileged)}))
     else:
       pde = self.nvdev.dual_pde_t if self._is_dual_pde() else self.nvdev.pde_t
       small, sys = ("_small" if self._is_dual_pde() else ""), "" if self.nvdev.mmu_ver == 3 else "_sys"

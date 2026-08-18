@@ -589,7 +589,7 @@ class NV_GSP(NV_IP):
     res, prom = {}, nv_gpu.NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS(entryCount=len(ctxbufs), engineType=0x1, hChanClient=client, hObject=obj)
     for i,(buf,desc) in enumerate(ctxbufs.items()):
       use_v, use_p = (desc.virt if virt is None else virt), (desc.phys if phys is None else phys)
-      x = (bufs or {}).get(buf, self.nvdev.mm.valloc(desc.size, contiguous=True)) # allocate buffers
+      x = (bufs or {}).get(buf, self.nvdev.mm.valloc(desc.size, contiguous=True, privileged=True)) # allocate buffers
       prom.promoteEntry[i] = nv_gpu.NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY(bufferId=buf, gpuVirtAddr=x.va_addr if use_v else 0, bInitialize=use_p,
         gpuPhysAddr=x.paddrs[0][0] if use_p else 0, size=desc.size if use_p else 0, physAttr=0x4 if use_p else 0, bNonmapped=(use_p and not use_v))
       res[buf] = x
@@ -745,9 +745,15 @@ class NV_GSP(NV_IP):
       _, _, method_sysaddrs = self.nvdev._alloc_boot_mem(self.mthdbuf_size, contiguous=True, sysmem=True)
       params.mthdbufMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=method_sysaddrs[0], size=self.mthdbuf_size, addressSpace=1, cacheAttrib=0)
 
-      if client is not None and client != self.priv_root and params.hObjectError != 0:
-        params.errorNotifierMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=0, size=0xecc, addressSpace=0, cacheAttrib=0)
-        params.userdMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=params.hUserdMemory[0] + params.userdOffset[0], size=0x400, addressSpace=2, cacheAttrib=0)
+      if client is not None and client != self.priv_root:
+        params.userdMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=params.hUserdMemory[0] + params.userdOffset[0], size=0x200, addressSpace=2, cacheAttrib=0)
+
+        # Declare the channel's error notifier the way nouveau does: PRIVILEGE=USER, and both notifier types explicitly NONE with a null handle.
+        # Leaving internalFlags at 0 means ERROR_NOTIFIER_TYPE_UNKNOWN, which the SDK reserves for kernel CPU-RM clients, and we were pairing it
+        # with an errorNotifierMem descriptor that was all zeroes -- a null memory descriptor GSP is entitled to walk straight into.
+        # NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS: PRIVILEGE 1:0 = USER(0), ERROR_NOTIFIER_TYPE 3:2 = NONE(1), ECC_ERROR_NOTIFIER_TYPE 5:4 = NONE(1).
+        params.hObjectError, params.errorNotifierMem = 0, nv_gpu.NV_MEMORY_DESC_PARAMS()
+        params.internalFlags = (0 << 0) | (1 << 2) | (1 << 4)
 
     alloc_args = nv.rpc_gsp_rm_alloc_v(hClient=(client:=client or self.priv_root), hParent=hParent, hObject=(obj:=handle or next(self.handle_gen)),
       hClass=hClass, flags=0x0, paramsSize=ctypes.sizeof(params) if params is not None else 0x0)
