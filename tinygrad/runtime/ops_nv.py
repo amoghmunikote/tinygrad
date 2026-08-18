@@ -143,6 +143,19 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     dev.gpu_mmio[0x90 // 4] = gpfifo.token
     gpfifo.put_value += 1
 
+    # Turing-only host-side FECS CTXSW_INTR0 acknowledger: spin-poll HOST_INT_STATUS (0x409c18) for a short window after every submit and write
+    # all 16 CTXSW_INTR bits to HOST_INT_CLEAR (0x409c20) if any are set. GSP-RM on Turing has no handler for CTXSW_INTR0 (asserts and dies via
+    # RISC-V ebreak in gr_error_gk110.c); the kernel driver survives because its own ISR ACKs it first. We do the same from userspace. Inline
+    # here rather than a background thread because the Python GIL starves a thread inside CPU-bound sequences like _setup_gpfifos. Bounded at
+    # 1024 iterations (~10us on x86) so it never blocks meaningfully. Ampere+ never raises CTXSW_INTR0 in the ctxsw conditions we hit, so the
+    # poll almost always exits on the first iter with STATUS=0.
+    if dev.tu_intr_ack:
+      _rreg, _wreg = dev.iface.dev_impl.rreg, dev.iface.dev_impl.wreg
+      for _ in range(1024):
+        if _rreg(0x409c18) & 0xFFFF:
+          _wreg(0x409c20, 0xFFFF)
+          break
+
 class NVComputeQueue(NVCommandQueue):
   def memory_barrier(self):
     self.nvm(1, nv_gpu.NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI,
@@ -643,6 +656,9 @@ class NVDevice(HCQCompiled[NVSignal]):
   def __init__(self, device:str=""):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.iface = self._select_iface()
+    # See _submit_to_gpfifo: on driverless Turing, spin-poll+clear FECS CTXSW_INTR0 after every doorbell so GSP-RM's ISR never sees the interrupt
+    # it has no handler for. Default-on for Turing driverless (the ctxsw hangs GSP without it); NV_TU_HOST_INTR_ACK=0 disables for A/B.
+    self.tu_intr_ack = self.is_nvd() and self.iface.compute_class == nv_gpu.TURING_COMPUTE_A and getenv("NV_TU_HOST_INTR_ACK", 1) != 0
 
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
                                                    vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)

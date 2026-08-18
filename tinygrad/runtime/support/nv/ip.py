@@ -695,6 +695,12 @@ class NV_GSP(NV_IP):
 
     self.priv_root = 0xc1e00004
     self.init_golden_image()
+
+    # Turing GSP-RM has no handler for FECS's CTXSW_INTR0 -- the ISR ends in NV_ASSERT_FAILED (RISC-V ebreak) inside gr_error_gk110.c. The
+    # kernel driver survives because its own host-side ISR ACKs the interrupt before GSP ever sees it. We do the same from userspace, inline
+    # in ops_nv._submit_to_gpfifo after every doorbell -- see the comment there for why this has to be in the submit thread rather than a
+    # daemon (Python GIL starves a background thread inside CPU-bound sequences like _setup_gpfifos).
+
     # init_scrubber() (the TU10x + 570.x bug-4208224 WAR) is left defined but uncalled: with the corrected promote_ctx its channel and 3D object
     # now allocate cleanly, but GSP still rejects the WAR control itself with NV_ERR_INVALID_STATE, and having the scrubber channel present
     # changes nothing about the compute channel's GR context. nouveau gives its scrubber a dedicated vmm/vaspace instead of sharing golden's,
