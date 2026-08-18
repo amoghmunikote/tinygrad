@@ -110,7 +110,6 @@ class NVDev:
     self.chip_name = CHIP_ARCH_NAMES[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
     self.fw_name = CHIP_FW_NAMES[self.chip_name[:3]]
 
-
     if self.fw_name == "tu102":
       self.include("dev_fb", "gp102")
       f = self.reg("NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE").read_bitfields()

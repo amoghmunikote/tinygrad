@@ -654,8 +654,7 @@ class NVDevice(HCQCompiled[NVSignal]):
   def is_nvd(self) -> bool: return isinstance(self.iface, PCIIface)
 
   def __init__(self, device:str=""):
-    self.device_id = int(device.split(":")[1]) if ":" in device else 0
-    self.iface = self._select_iface()
+    self.iface = self._select_iface(device)
     # See _submit_to_gpfifo: on driverless Turing, spin-poll+clear FECS CTXSW_INTR0 after every doorbell so GSP-RM's ISR never sees the interrupt
     # it has no handler for. Default-on for Turing driverless (the ctxsw hangs GSP without it); NV_TU_HOST_INTR_ACK=0 disables for A/B.
     self.tu_intr_ack = self.is_nvd() and self.iface.compute_class == nv_gpu.TURING_COMPUTE_A and getenv("NV_TU_HOST_INTR_ACK", 1) != 0
