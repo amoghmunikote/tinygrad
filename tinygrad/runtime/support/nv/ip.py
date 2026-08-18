@@ -634,29 +634,6 @@ class NV_GSP(NV_IP):
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.compute_class, params=None)
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.dma_class, params=None)
     self.rpc_free(ch_gpfifo)
-    self._golden_dev, self._golden_subdev, self._golden_vaspace = dev, subdev, vaspace
-
-  def init_scrubber(self):
-    if self.nvdev.chip_name not in ("TU102", "TU104", "TU106"): return
-    dev, subdev, vaspace = self._golden_dev, self._golden_subdev, self._golden_vaspace
-
-    gpfifo_area = self.nvdev.mm.valloc(4 << 10, contiguous=True)
-    userd = nv_gpu.NV_MEMORY_DESC_PARAMS(base=gpfifo_area.paddrs[0][0] + 0x20 * 8, size=0x20, addressSpace=2, cacheAttrib=0)
-    gg_params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(gpFifoOffset=gpfifo_area.va_addr, gpFifoEntries=32, engineType=0x1, cid=4,
-      hVASpace=vaspace, userdOffset=(ctypes.c_uint64*8)(0x20 * 8), userdMem=userd, internalFlags=0x1a, flags=0x200320)
-    ch_gpfifo = self.rpc_rm_alloc(hParent=dev, hClass=self.gpfifo_class, params=gg_params, handle=0xdada0045)
-
-    chan_bufs = {k:self.grctx_bufs[k] for k in (0, 2) if k in self.grctx_bufs}
-    glob_bufs = {k:dataclasses.replace(self.grctx_bufs[k], phys=False, virt=True) for k in (3, 4, 5, 6, 9, 10) if k in self.grctx_bufs}
-    self.promote_ctx(self.priv_root, subdev, ch_gpfifo, {**chan_bufs, **glob_bufs},
-                     bufs={k:v for k,v in self._golden_ctxbufs.items() if k in glob_bufs})
-    self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.threed_class, params=None, handle=0xdada0046)
-
-    try:
-      self.rpc_rm_control(hObject=subdev, cmd=nv_gpu.NV2080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR,
-        params=nv_gpu.NV2080_CTRL_INTERNAL_KGR_INIT_BUG4208224_WAR_PARAMS(bTeardown=0))
-    except RuntimeError as e:
-      if DEBUG >= 2: print(f"nv {self.nvdev.devfmt}: bug4208224 WAR control rejected ({e}), continuing with the scrubber channel in place")
 
   def init_hw(self):
     self.stat_q = NVRpcQueue(self, self.stat_q_view, self.cmd_q_view)

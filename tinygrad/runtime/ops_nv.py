@@ -413,7 +413,6 @@ class GPFifo:
   gpput: MMIOInterface
   entries_count: int
   token: int
-  handle: int = 0
   put_value: int = 0
 
 class NVKIface:
@@ -742,7 +741,7 @@ class NVDevice(HCQCompiled[NVSignal]):
       if self.is_nvd() and (token & 0xfff) != chid: print(f"nv: WARNING token {token:#x} has chid {token & 0xfff}, we forced {chid}")
     if not video: self.iface.setup_gpfifo_vm(gpfifo)
 
-    return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=token, handle=gpfifo,
+    return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=token,
                   gpput=gpfifo_area.cpu_view().view(offset + entries*8 + getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, fmt='I'))
 
   def _query_runlists(self) -> dict[int, int]:
