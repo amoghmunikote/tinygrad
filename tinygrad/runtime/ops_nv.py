@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, weakref
+import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, weakref, itertools
 assert sys.platform != 'win32'
 from typing import cast
 from dataclasses import dataclass
@@ -7,7 +7,7 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, H
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, hcq_filter_visible_devices, hcq_profile
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
-from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent
+from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent, DEBUG
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
@@ -135,6 +135,11 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     gpfifo.gpput[0] = (gpfifo.put_value + 1) % gpfifo.entries_count
 
     System.memory_barrier()
+    # memory_barrier is a CPU fence: it orders our stores but does nothing to push already-posted PCIe writes out to the device. The ring and GPPut
+    # live in a write-combined BAR mapping while the doorbell below is a separate uncached BAR, so without a read the doorbell can reach the GPU
+    # before the entry it is announcing -- HOST then fetches a stale GPPut and nothing runs. A read from the same BAR flushes the posted writes
+    # (a PCIe read cannot pass them), which is exactly what nouveau does between its GPPut store and its doorbell write.
+    if dev.is_nvd(): _ = gpfifo.gpput[0]
     dev.gpu_mmio[0x90 // 4] = gpfifo.token
     gpfifo.put_value += 1
 
@@ -646,6 +651,11 @@ class NVDevice(HCQCompiled[NVSignal]):
     self.virtmem = self.iface.rm_alloc(self.nvdevice, nv_gpu.NV01_MEMORY_VIRTUAL, nv_gpu.NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS(limit=0x1ffffffffffff))
     self.usermode, self.gpu_mmio = self.iface.setup_usermode()
 
+    # Driverless only: GSP never reports a channel's chid back, so pick it ourselves and force it via the USERD index flags in _new_gpu_fifo. chid 0
+    # is reserved for GSP's own channels, and USERD page 0 (chids 1-7) is shared with the golden channel (chid 3), so start at 8 -- our three channels
+    # (compute, dma, video) then land at 8/9/10, together in their own USERD owner-isolation page.
+    if self.is_nvd(): self.chid_gen, self.runlists = itertools.count(8), self._query_runlists()
+
     self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_PERF_BOOST, nv_gpu.NV2080_CTRL_PERF_BOOST_PARAMS(duration=0xffffffff,
       flags=((nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES << 4) | (nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_PRIORITY_HIGH << 6) | \
              (nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX))))
@@ -709,21 +719,38 @@ class NVDevice(HCQCompiled[NVSignal]):
 
   def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False, vaspace=0) -> GPFifo:
     notifier = self.iface.alloc(48 << 20, uncached=True)
+
+    # Force the channel onto a chid of our choosing. GSP decodes these flags as ChID = page*8 + index (8 = 4K page / 512B userd), and this is the
+    # sanctioned mechanism rather than a trick: kernel RM itself rewrites exactly these four fields when forwarding a channel alloc to GSP
+    # (kernel_channel.c, inside `if (IS_GSP_CLIENT(pGpu))`, commented "Setting these param flags will make the Physical RMAPI use our ChID").
+    # We need to know the chid because on Turing we have to build the work submit token ourselves, see below. INDEX_FIXED must stay false while
+    # PAGE_FIXED is true. Leaving flags 0 (as before) lets GSP pick a chid off its own heap and never tell us what it picked.
+    chid = next(self.chid_gen) if self.is_nvd() else 0
+    ch_flags = nv_flags("NVOS04_FLAGS", channel_userd_index_value=chid % 8, channel_userd_index_fixed="false",
+                        channel_userd_index_page_value=chid // 8, channel_userd_index_page_fixed="true") if self.is_nvd() else 0
+
     # NVDEC channels must not use the UVM-owned (externally owned) vaspace: RM skips mapping the engine ctx buffer for it and UVM never maps it
     # for video engines, so the channel would run with an invalid ctx. Use the RM-managed vaspace, which _gpu_uvm_map also maps every buffer into.
     params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(gpFifoOffset=gpfifo_area.va_addr+offset, gpFifoEntries=entries, hContextShare=ctxshare,
       hVASpace=vaspace if ctxshare == 0 else 0, hObjectError=notifier.meta.hMemory, hObjectBuffer=self.virtmem if video else gpfifo_area.meta.hMemory,
-      hUserdMemory=(ctypes.c_uint32*8)(gpfifo_area.meta.hMemory), userdOffset=(ctypes.c_uint64*8)(entries*8+offset), engineType=19 if video else 0)
+      hUserdMemory=(ctypes.c_uint32*8)(gpfifo_area.meta.hMemory), userdOffset=(ctypes.c_uint64*8)(entries*8+offset), engineType=19 if video else 0,
+      flags=ch_flags)
     gpfifo = self.iface.rm_alloc(channel_group, self.iface.gpfifo_class, params)
 
     # Pre-Ampere the runlist isn't committed when the channel is constructed (kernel RM does this for us on that path; GSP doesn't), and both the
     # engine-context promotion triggered by the compute/dma object allocs below and the work submit token query further down need it committed
     # first, so bind right after the channel exists and before anything else touches it. BIND needs the channel's real engine type -- NULL (0)
     # silently no-ops the runlist assignment for SW/BUS engines and, worse, was defaulting the DMA channel onto the graphics engine's runlist.
+    # RM_ENGINE_TYPE (not NV2080_ENGINE_TYPE) for the runlist lookup below -- GR0/COPY0 coincide across the two enums, NVDEC0 does not (0x1d vs 0x13).
     bind_engine_type = params.engineType if video else (nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS if compute else nv_gpu.NV2080_ENGINE_TYPE_COPY0)
+    rm_engine_type = 0x1d if video else (1 if compute else 9)
     if channel_group == self.nvdevice:
       self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_BIND, nv_gpu.NVA06F_CTRL_BIND_PARAMS(engineType=bind_engine_type))
-      if self.is_nvd(): self._diag_probe("after-bind", gpfifo)
+      # nouveau's order is alloc -> BIND -> SCHEDULE, all before any engine object exists on the channel; match it on the driverless path. The
+      # kernel-driver path keeps scheduling after the object alloc (below) -- this branch is also the NVDEC video channel there, and that ordering
+      # is what NVDEC is known to work with.
+      if self.is_nvd():
+        self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
 
     if compute:
       self.debug_compute_obj, self.debug_channel = self.iface.rm_alloc(gpfifo, self.iface.compute_class), gpfifo
@@ -732,16 +759,42 @@ class NVDevice(HCQCompiled[NVSignal]):
     elif not video: self.iface.rm_alloc(gpfifo, self.iface.dma_class)
     else: self.iface.rm_alloc(gpfifo, self.iface.viddec_class, nv_gpu.NV_BSP_ALLOCATION_PARAMETERS(size=nv_gpu.NV_BSP_ALLOCATION_PARAMETERS.SIZE))
 
-    if channel_group == self.nvdevice:
+    if channel_group == self.nvdevice and not self.is_nvd():
       self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
-      if self.is_nvd(): self._diag_probe("after-schedule", gpfifo)
 
-    token = self.iface.rm_control(gpfifo, nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
-      nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1)).workSubmitToken
+    # Turing's GSP firmware cannot generate a work submit token for a client channel. kfifoGenerateWorkSubmitTokenHal_TU102 hard-gates on
+    # kchannelIsRunlistSet, and unlike GA100+ (which wraps that check in `if (!RMCFG_FEATURE_PLATFORM_GSP ...)` and otherwise calls
+    # kfifoGenerateInternalWorkSubmitToken -- a function with no Turing implementation at all) it has no escape hatch, so inside GSP it always
+    # runs and always fails for us. The token is only (runlistId << 16) | chid though (NV_CTRL_VF_DOORBELL_RUNLIST_ID 22:16, _VECTOR 11:0, no
+    # enable bit -- that's GB202-only), and we know both halves, so build it here exactly like nouveau's tu102_chan_doorbell_handle does.
+    if self.is_nvd() and self.iface.dev_impl.chip_name.startswith("TU"):
+      token = (self.runlists[rm_engine_type] << 16) | chid
+      if DEBUG >= 2: print(f"nv {self.iface.dev_impl.devfmt}: local token for {'video' if video else 'compute' if compute else 'dma'}: "
+                           f"runlist={self.runlists[rm_engine_type]} chid={chid} token={token:#x}")
+    else:
+      token = self.iface.rm_control(gpfifo, nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
+        nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1)).workSubmitToken
+      # Free cross-check on the driverless paths that already work: RM's own token must carry the chid we forced in its low 12 bits.
+      if self.is_nvd() and (token & 0xfff) != chid: print(f"nv: WARNING token {token:#x} has chid {token & 0xfff}, we forced {chid}")
     if not video: self.iface.setup_gpfifo_vm(gpfifo)
 
     return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=token, handle=gpfifo,
                   gpput=gpfifo_area.cpu_view().view(offset + entries*8 + getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, fmt='I'))
+
+  # engineData[] indices are the ABI-frozen ENGINE_INFO_TYPE enum from engine_info.h: 2 = RM_ENGINE_TYPE, 3 = RUNLIST. Note RM_ENGINE_TYPE is a
+  # different numbering space from NV2080_ENGINE_TYPE -- GR0=1 and COPY0=9 happen to coincide, but NVDEC0 is 0x1d here vs NV2080's 0x13 -- so this
+  # map is keyed by RM_ENGINE_TYPE only. setdefault keeps the first entry per engine, matching how nouveau walks the same table.
+  def _query_runlists(self) -> dict[int, int]:
+    runlists:dict[int, int] = {}
+    base = 0
+    while True:
+      res = self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE,
+        nv_gpu.NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS(baseIndex=base))
+      for i in range(res.numEntries): runlists.setdefault(res.entries[i].engineData[2], res.entries[i].engineData[3])
+      if not res.bMore: break
+      base += res.numEntries
+    if DEBUG >= 2: print(f"nv {self.iface.dev_impl.devfmt}: runlists (RM_ENGINE_TYPE -> runlistId): {({hex(k):v for k,v in runlists.items()})}")
+    return runlists
 
   def _query_gpu_info(self, *reqs):
     nvrs = [getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_'+r.upper(), getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_LITTER_'+r.upper(), None)) for r in reqs]
