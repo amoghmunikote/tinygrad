@@ -7,6 +7,8 @@ from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.elf import elf_loader
 
+def rm_err(status:int) -> str: return f"{status}: {nv_gpu.nv_status_codes.get(status, 'Unknown error')}"
+
 @dataclasses.dataclass(frozen=True)
 class GRBufDesc: size:int; virt:bool; phys:bool; local:bool=False # noqa: E702
 
@@ -547,7 +549,8 @@ class NV_GSP(NV_IP):
     alloc_args = nv.rpc_gsp_rm_alloc_v(hClient=(client:=client or self.priv_root), hParent=hParent, hObject=(obj:=next(self.handle_gen)),
       hClass=hClass, flags=0x0, paramsSize=ctypes.sizeof(params) if params is not None else 0x0)
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC, bytes(alloc_args) + (bytes(params) if params is not None else b''))
-    self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC)
+    res = self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC)
+    if (st:=nv.rpc_gsp_rm_alloc_v.from_buffer_copy(res).status) != 0: raise RuntimeError(f"rm_alloc of {hClass:#x} returned {rm_err(st)}")
 
     if hClass == nv_gpu.FERMI_VASPACE_A and client != self.priv_root:
       self.rpc_set_page_directory(device=hParent, hVASpace=obj, pdir_paddr=self.nvdev.mm.root_page_table.paddr, client=client)
@@ -573,6 +576,8 @@ class NV_GSP(NV_IP):
       paramsSize=ctypes.sizeof(params) if params is not None else 0x0)
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL, bytes(control_args) + (bytes(params) if params is not None else b''))
     res = self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL)
+    if (status:=nv.rpc_gsp_rm_control_v.from_buffer_copy(res).status) != 0:
+      raise RuntimeError(f"rm_control {cmd:#x} on {hObject:#x} returned {rm_err(status)}")
     st = type(params).from_buffer_copy(res[len(bytes(control_args)):]) if params is not None else None
 
     # NOTE: gb20x requires the enable bit for token submission. Patch workSubmitToken here to maintain userspace compatibility.
