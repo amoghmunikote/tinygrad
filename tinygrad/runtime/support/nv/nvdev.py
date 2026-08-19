@@ -9,9 +9,6 @@ from tinygrad.runtime.support.hcq import MMIOInterface
 
 NV_DEBUG = getenv("NV_DEBUG", 0)
 
-CHIP_ARCH_NAMES = {0x16: "TU1", 0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}
-CHIP_FW_NAMES = {"TU1": "tu102", "GA1": "ga102", "AD1": "ad102", "GB2": "gb202"}
-
 class NVReg:
   def __init__(self, nvdev, base, off, fields=None): self.nvdev, self.base, self.off, self.fields = nvdev, base, off, fields
 
@@ -104,11 +101,13 @@ class NVDev:
 
     self.include("nv_ref", "")
     self.include("dev_fb", "tu102")
+    self.include("dev_gc6_island", "ga102")
 
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()
     self.chip_details = self.reg("NV_PMC_BOOT_42").read_bitfields()
-    self.chip_name = CHIP_ARCH_NAMES[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
-    self.fw_name = CHIP_FW_NAMES[self.chip_name[:3]]
+    arch = self.chip_details['architecture']
+    self.chip_name = {0x16: "TU1", 0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[arch] + f"{self.chip_details['implementation']:02d}"
+    self.fw_name = {"TU1": "tu102", "GA1": "ga102", "AD1": "ad102", "GB2": "gb202"}[self.chip_name[:3]]
 
     if self.fw_name == "tu102":
       self.include("dev_fb", "gp102")
@@ -116,17 +115,14 @@ class NVDev:
       self.vram_size = f['lower_mag'] << (f['lower_scale'] + 20)
       if f['ecc_mode'] == 1: self.vram_size = self.vram_size // 16 * 15
 
-    self.reset_fired = self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0 or bool(getenv("NV_FORCE_RESET"))
-    if self.reset_fired:
+    if self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0:
       self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
-      if DEBUG >= 2: print(f"nv {self.devfmt}: issuing full reset (WPR2 up or NV_FORCE_RESET)", flush=True)
+      if DEBUG >= 2: print(f"nv {self.devfmt}: WPR2 is up. Issuing a full reset.", flush=True)
       self.pci_dev.reset()
       time.sleep(0.1) # wait until device can respond again
 
     self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
-
-    self.include("dev_gc6_island", "ga102")
 
     self.flcn:NV_FLCN|NV_FLCN_COT = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
     self.gsp:NV_GSP = NV_GSP(self)
