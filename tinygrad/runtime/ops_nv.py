@@ -43,7 +43,6 @@ def nv_iowr(fd:FileIOInterface, nr, args, cmd=None):
 
 class QMD:
   fields: dict[str, dict[str, tuple[int, int]]] = {}
-  VER_PREFIXES = {5: "NVCEC0_QMDV05_00", 3: "NVC6C0_QMDV03_00", 2: "NVC6C0_QMDV02_03"}
 
   def __init__(self, dev:NVDevice, view:MMIOInterface|None=None, **kwargs):
     if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A: self.ver, self.sz = 5, 0x60
@@ -51,8 +50,7 @@ class QMD:
     else: self.ver, self.sz = 2, 0x40
 
     # Init fields from module
-    pref = QMD.VER_PREFIXES[self.ver]
-    if pref not in QMD.fields:
+    if (pref:="NVCEC0_QMDV05_00" if self.ver == 5 else "NVC6C0_QMDV03_00" if self.ver == 3 else "NVC6C0_QMDV02_03") not in QMD.fields:
       QMD.fields[pref] = {**{name[len(pref)+1:]: dt for name,dt in nv_gpu.__dict__.items() if name.startswith(pref) and isinstance(dt, tuple)},
         **{name[len(pref)+1:]+f"_{i}": dt(i) for name,dt in nv_gpu.__dict__.items() for i in range(8) if name.startswith(pref) and callable(dt)}}
 
@@ -479,22 +477,19 @@ class NVKIface:
     nv_iowr(fd or self.fd_uvm, None, params, cmd=cmd)
     if params.rmStatus != 0: raise RuntimeError(f"uvm returned {get_error_str(params.rmStatus)}")
 
-  def _get_class(self, class_list):
-    return next(c for c in class_list if c in self.nvclasses)
-
-  def _get_class_or_none(self, class_list):
-    return next((c for c in class_list if c in self.nvclasses), None)
-
   def setup_usermode(self):
     clsnum = self.rm_control(self.dev.nvdevice, nv_gpu.NV0080_CTRL_CMD_GPU_GET_CLASSLIST, nv_gpu.NV0080_CTRL_GPU_GET_CLASSLIST_PARAMS(numClasses=0))
     clsinfo = self.rm_control(self.dev.nvdevice, nv_gpu.NV0080_CTRL_CMD_GPU_GET_CLASSLIST, nv_gpu.NV0080_CTRL_GPU_GET_CLASSLIST_PARAMS(
       numClasses=clsnum.numClasses, classList=mv_address(classlist:=memoryview(bytearray(clsnum.numClasses * 4)).cast('I'))))
     self.nvclasses = {classlist[i] for i in range(clsinfo.numClasses)}
-    self.usermode_class = self._get_class([nv_gpu.HOPPER_USERMODE_A, nv_gpu.TURING_USERMODE_A])
-    self.gpfifo_class = self._get_class([nv_gpu.BLACKWELL_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_CHANNEL_GPFIFO_A, nv_gpu.TURING_CHANNEL_GPFIFO_A])
-    self.compute_class = self._get_class([nv_gpu.BLACKWELL_COMPUTE_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.TURING_COMPUTE_A])
-    self.dma_class = self._get_class([nv_gpu.BLACKWELL_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_B, nv_gpu.TURING_DMA_COPY_A])
-    self.viddec_class = self._get_class_or_none([nv_gpu.NVCFB0_VIDEO_DECODER, nv_gpu.NVC9B0_VIDEO_DECODER, nv_gpu.NVC4B0_VIDEO_DECODER])
+    self.usermode_class:int = next(c for c in [nv_gpu.HOPPER_USERMODE_A, nv_gpu.TURING_USERMODE_A] if c in self.nvclasses)
+    self.gpfifo_class:int = next(c for c in [nv_gpu.BLACKWELL_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_CHANNEL_GPFIFO_A, nv_gpu.TURING_CHANNEL_GPFIFO_A]
+                                  if c in self.nvclasses)
+    self.compute_class:int = next(c for c in [nv_gpu.BLACKWELL_COMPUTE_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.TURING_COMPUTE_A]
+                                   if c in self.nvclasses)
+    self.dma_class:int = next(c for c in [nv_gpu.BLACKWELL_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_B, nv_gpu.TURING_DMA_COPY_A] if c in self.nvclasses)
+    self.viddec_class:int|None = next((c for c in [nv_gpu.NVCFB0_VIDEO_DECODER, nv_gpu.NVC9B0_VIDEO_DECODER, nv_gpu.NVC4B0_VIDEO_DECODER]
+                                       if c in self.nvclasses), None)
 
     usermode = self.rm_alloc(self.dev.subdevice, self.usermode_class)
     return usermode, MMIOInterface(self._gpu_map_to_cpu(usermode, mmio_sz:=0x10000), mmio_sz, fmt='I')
