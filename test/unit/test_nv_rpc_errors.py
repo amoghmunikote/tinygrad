@@ -11,7 +11,7 @@ class TestNVRpcErrors(unittest.TestCase):
     gsp = NV_GSP.__new__(NV_GSP)
     gsp.nvdev = types.SimpleNamespace(chip_name="GA102")
     gsp.priv_root, gsp.handle_gen = 0xc1e00004, itertools.count(1)
-    gsp.gpfifo_class, gsp.compute_class = -1, -1 # avoid the gpfifo/compute-specific promote_ctx branches
+    gsp.gpfifo_class, gsp.compute_class = -1, -1
     gsp.cmd_q = types.SimpleNamespace(send_rpc=lambda func, msg: None)
     gsp.stat_q = StatQ(resp)
     return gsp
